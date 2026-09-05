@@ -12,6 +12,7 @@ from freetoken.models.config import (
     ModelConfig,
     RotaryConfig,
     SlotStateSpec,
+    detect_expert_quant,
 )
 
 
@@ -153,15 +154,39 @@ def parse_config(hf_config: Any) -> ModelConfig:
     if get is None:
         expert_quant = attn_quant = dense_quant = lm_head_quant = "none"
     else:
+        detected_expert_quant = detect_expert_quant(hf_config)
         algo = str(get("quant_algo") or get("quant_method") or "").lower()
         block = get("weight_block_size")
-        if algo == "fp8" and block:
+        if detected_expert_quant == "nvfp4":
+            expert_quant = "nvfp4"
+            attn_quant = dense_quant = lm_head_quant = "none"
+        elif algo == "fp8" and block:
             # Official FP8 build (DeepSeek-V3-style block-fp8): only the routed experts
             # are quantized (fp8-e4m3 weights + per-block weight_scale_inv); attention,
             # GDN, the shared expert, HC, PLE and lm_head stay bf16.
             bs = tuple(int(x) for x in block)
             assert bs == (128, 128), f"only 128x128 block-fp8 is supported, got {bs}"
             expert_quant = "fp8_block"
+            attn_quant = dense_quant = lm_head_quant = "none"
+        elif algo == "mixed_precision":
+            # modelopt MIXED_PRECISION declares quantization per module in
+            # ``quantized_layers`` rather than once at the top level.
+            quantized = get("quantized_layers") or {}
+
+            def _is_nvfp4(spec: Any) -> bool:
+                if isinstance(spec, dict):
+                    return any(_is_nvfp4(value) for value in spec.values())
+                if isinstance(spec, (list, tuple)):
+                    return any(_is_nvfp4(value) for value in spec)
+                return "NVFP4" in str(spec).upper()
+
+            layer_specs = quantized.items() if isinstance(quantized, dict) else enumerate(quantized)
+            experts_nvfp4 = any(
+                (".mlp.experts" in f"{module} {spec}" or "EXPERT" in f"{module} {spec}".upper())
+                and _is_nvfp4(spec)
+                for module, spec in layer_specs
+            )
+            expert_quant = "nvfp4" if experts_nvfp4 else "none"
             attn_quant = dense_quant = lm_head_quant = "none"
         else:
             is_fp4 = "fp4" in algo

@@ -127,6 +127,35 @@ def test_moe_and_quant_flags():
     assert cfg.lm_head_quant == "none"
 
 
+def test_mixed_precision_quantized_layers_detect_nvfp4_experts():
+    hf = _hf_config()
+    hf.quantization_config = {
+        "quant_algo": "MIXED_PRECISION",
+        "quantized_layers": {
+            "model.language_model.layers.*.mlp.experts.*": {"quant_algo": "NVFP4"},
+            "model.language_model.layers.*.self_attn.*": {"quant_algo": "FP8"},
+        },
+    }
+
+    cfg = parse_config(hf)
+
+    assert cfg.expert_quant == "nvfp4"
+    assert cfg.attn_quant == cfg.dense_quant == cfg.lm_head_quant == "none"
+
+
+def test_mixed_precision_sequence_specs_detect_nvfp4_experts():
+    hf = _hf_config()
+    hf.quantization_config = {
+        "quant_algo": "MIXED_PRECISION",
+        "quantized_layers": [
+            "model.language_model.layers.*.mlp.experts.*: NVFP4",
+            "model.language_model.layers.*.self_attn.*: FP8",
+        ],
+    }
+
+    assert parse_config(hf).expert_quant == "nvfp4"
+
+
 def test_unquantized_config_parses():
     hf = _hf_config()
     hf.quantization_config = None

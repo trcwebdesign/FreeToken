@@ -21,7 +21,7 @@ from typing import Iterator
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
-from freetoken.models.loader import drop_page_cache, iter_weight_files
+from freetoken.models.loader import ShardReader, drop_page_cache, iter_weight_files
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
     load_nvfp4_expert_source_banks,
@@ -45,8 +45,20 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     layer_to_bank=lambda layer, config: layer,  # every layer is MoE
     desc="Qwen3.8-Flash-Next NVFP4 experts",
 )
+_NVFP4_CT_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
+    key_pattern=re.compile(
+        r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+        r"(?P<proj>gate_proj|up_proj|down_proj)\."
+        r"(?P<kind>weight_packed|weight_global_scale|weight_scale)$"
+    ),
+    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+    layer_to_bank=lambda layer, config: layer,
+    desc="Qwen3.8-Flash-Next NVFP4 experts (compressed-tensors)",
+    kind_map={"weight_packed": "weight", "weight_global_scale": "weight_scale_2"},
+    global_reciprocal=True,
+)
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
-_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
+_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".weight_scale_inv", ".input_scale")
 
 # The n-gram table itself: too big for the dense state dict, loaded by load_ple_table.
 _PLE_TABLE_INFIX = ".ple.ple_embedding.ngram_embedding."
@@ -137,6 +149,41 @@ def _try_fuse(
     return None
 
 
+def _load_maybe_quantized(reader: ShardReader, raw_name: str) -> torch.Tensor:
+    """Load a weight, dequantizing dense FP8 tensors to the fusion dtype.
+
+    Quantization siblings can be stored in a different safetensors shard. Packed NVFP4
+    weights are uint8 and remain untouched because routed experts use their bank loader.
+    """
+    tensor = reader.get_tensor(raw_name)
+    if not raw_name.endswith(".weight") or tensor.dtype == torch.uint8:
+        return tensor
+
+    def _get_optional(name: str) -> torch.Tensor | None:
+        try:
+            return reader.get_tensor(name)
+        except KeyError:
+            return None
+
+    base = raw_name[: -len(".weight")]
+    inverse_scale_name = base + ".weight_scale_inv"
+    inverse_scale = _get_optional(inverse_scale_name)
+    if inverse_scale is not None:
+        from freetoken.kernel.triton.fp8_block_linear import dequant_block_fp8
+
+        return dequant_block_fp8(tensor, inverse_scale)
+
+    scale_name = base + ".weight_scale"
+    scale = _get_optional(scale_name)
+    if scale is not None and tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        scale = scale.to(torch.bfloat16)
+        if scale.numel() == tensor.shape[0] and scale.ndim == 1:
+            scale = scale.reshape(-1, 1)
+        return tensor.to(torch.bfloat16) * scale
+
+    return tensor.to(torch.bfloat16) if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) else tensor
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -163,23 +210,26 @@ def iter_weights(
         return
 
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
-    for file in tqdm(
-        iter_weight_files(model_path),
-        desc="Loading weights",
-        disable=not get_tp_info().is_primary(),
-    ):
-        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
-            for raw_name in f.keys():
+    reader = ShardReader(model_path, device)
+    try:
+        for file in tqdm(
+            reader.files(),
+            desc="Loading weights",
+            disable=not get_tp_info().is_primary(),
+        ):
+            for raw_name in reader.names_in(file):
                 name = _rename(raw_name)
                 if name is None:
                     continue
-                tensor = f.get_tensor(raw_name)
+                tensor = _load_maybe_quantized(reader, raw_name)
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
                         yield fused
                     continue
                 yield name, tensor
+    finally:
+        reader.close()
 
     assert not fuse_buf, f"Incomplete projection fusions: {sorted(fuse_buf)}"
 
@@ -291,10 +341,16 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
 
 def load_nvfp4_expert_sources(model_path: str, config, *, layer_sink=None) -> dict:
     """Build the CPU NVFP4 expert source banks for the offload cache (gate/up fused on the output-row axis, down separate; weight_scale_2 carried as the per-row global scale)."""
+    from freetoken.utils import cached_load_hf_config
+
+    hf_config = cached_load_hf_config(model_path)
+    quant = getattr(hf_config, "quantization_config", None) or {}
+    get = quant.get if isinstance(quant, dict) else (lambda key, default=None: getattr(quant, key, default))
+    spec = _NVFP4_CT_SOURCE_SPEC if str(get("quant_method") or "").lower() == "compressed-tensors" else _NVFP4_SOURCE_SPEC
     return load_nvfp4_expert_source_banks(
         model_path,
         config,
-        _NVFP4_SOURCE_SPEC,
+        spec,
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         layer_sink=layer_sink,
@@ -306,11 +362,17 @@ def load_nvfp4_expert_sources_parallel(
 ) -> dict:
     """parallel: same NVFP4 source banks via the common chunked multi-threaded reader."""
     from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
+    from freetoken.utils import cached_load_hf_config
+
+    hf_config = cached_load_hf_config(model_path)
+    quant = getattr(hf_config, "quantization_config", None) or {}
+    get = quant.get if isinstance(quant, dict) else (lambda key, default=None: getattr(quant, key, default))
+    spec = _NVFP4_CT_SOURCE_SPEC if str(get("quant_method") or "").lower() == "compressed-tensors" else _NVFP4_SOURCE_SPEC
 
     return load_nvfp4_expert_source_banks_parallel(
         model_path,
         config,
-        _NVFP4_SOURCE_SPEC,
+        spec,
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         workers=workers,
