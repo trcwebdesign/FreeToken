@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .reader import gguf_architecture, load_gguf_metadata
+from .reader import gguf_architecture, gguf_tensor_names, load_gguf_metadata
 
 # GGUF architecture -> transformers GGUF tokenizer-converter key.
 _TOKENIZER_ARCH = {"gemma4": "gemma4_text"}
@@ -19,6 +19,11 @@ _TOKENIZER_ARCH = {"gemma4": "gemma4_text"}
 def load_gguf_tokenizer(model_path: str):
     from transformers import PreTrainedTokenizerFast
     from transformers.integrations.ggml import convert_gguf_tokenizer
+    from tokenizers import Tokenizer
+    from tokenizers.decoders import ByteFallback, Fuse, Replace as DecoderReplace, Sequence as DecoderSequence
+    from tokenizers.models import BPE
+    from tokenizers.normalizers import Replace as NormalizerReplace
+    from tokenizers.pre_tokenizers import Split
 
     meta = load_gguf_metadata(model_path)
     arch = gguf_architecture(model_path)
@@ -28,7 +33,31 @@ def load_gguf_tokenizer(model_path: str):
         for k, v in meta.items()
         if k.startswith("tokenizer.ggml.")
     }
-    fast, _extra = convert_gguf_tokenizer(conv_arch, tok_dict)
+    hf_nvfp4 = meta.get("freetoken.gguf_format") == "hf_nvfp4" or (
+        "model.language_model.embed_tokens.weight" in gguf_tensor_names(model_path)
+    )
+    if hf_nvfp4:
+        # The HF Gemma 4 tokenizer.json is BPE (Split on spaces, then replace spaces
+        # with the sentencepiece marker). Transformers' Gemma GGUF converter assumes
+        # Unigram and silently produces different token IDs for this export.
+        vocab = {token: index for index, token in enumerate(tok_dict["tokens"])}
+        merges = [tuple(merge.split(" ", 1)) for merge in tok_dict["merges"]]
+        fast = Tokenizer(
+            BPE(
+                vocab=vocab,
+                merges=merges,
+                unk_token="<unk>",
+                fuse_unk=True,
+                byte_fallback=True,
+            )
+        )
+        fast.normalizer = NormalizerReplace(" ", "▁")
+        fast.pre_tokenizer = Split(" ", behavior="merged_with_previous")
+        fast.decoder = DecoderSequence(
+            [DecoderReplace("▁", " "), ByteFallback(), Fuse()]
+        )
+    else:
+        fast, _extra = convert_gguf_tokenizer(conv_arch, tok_dict)
 
     tokens = tok_dict["tokens"]
 
