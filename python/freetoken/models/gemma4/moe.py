@@ -16,7 +16,12 @@ class Gemma4Router(BaseOP):
 
     def __init__(self, config: ModelConfig):
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, with_scale=False)
-        self.proj = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
+        if getattr(config, "moe_weight_format", None) == "nvfp4":
+            from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseLinear
+
+            self.proj = Nvfp4DenseLinear(config.hidden_size, config.num_experts, has_bias=False)
+        else:
+            self.proj = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
         self.scale = torch.empty(config.hidden_size)
         self.per_expert_scale = torch.empty(config.num_experts)
         self._scalar_root = config.hidden_size ** -0.5
@@ -40,7 +45,11 @@ class Gemma4MLP(BaseOP):
     """Gemma 4 feed-forward sandwich: shared MLP plus routed MoE branch."""
 
     def __init__(self, config: ModelConfig, layer_id: int):
-        self.shared_mlp = GatedMLP(config)
+        self.shared_mlp = (
+            _Nvfp4GatedMLP(config)
+            if getattr(config, "moe_weight_format", None) == "nvfp4"
+            else GatedMLP(config)
+        )
         self.experts = make_moe_layer(
             config,
             layer_id=layer_id,

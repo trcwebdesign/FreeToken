@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .reader import gguf_architecture, load_gguf_metadata, gguf_tensor_names
+from .reader import GGML_NVFP4, GGUF_FORMAT_KV, gguf_architecture, load_gguf_metadata, gguf_tensor_names
 
 # GGUF ``general.architecture`` -> FreeToken registry key (a GGUF-specific spec that
 # reuses the model classes but a GGUF parse_config / iter_weights).
@@ -29,6 +29,17 @@ class GgufConfigShim:
     metadata: dict[str, Any]
     vocab_size: int
     tie_word_embeddings: bool
+
+    @property
+    def is_hf_nvfp4(self) -> bool:
+        from .reader import _reader
+
+        if self.metadata.get(GGUF_FORMAT_KV) == "hf_nvfp4":
+            return True
+        return (
+            "model.language_model.embed_tokens.weight" in gguf_tensor_names(self.model_path)
+            and any(int(t.tensor_type) == GGML_NVFP4 for t in _reader(self.model_path).tensors)
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Minimal HF-config-like dict for trunk code that introspects the config

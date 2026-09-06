@@ -14,6 +14,7 @@ from .weight import (
     iter_weights_parallel,
     load_nvfp4_expert_sources,
     load_nvfp4_expert_sources_parallel,
+    setup_offload_expert_banks,
 )
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "iter_weights_parallel",
     "load_nvfp4_expert_sources",
     "load_nvfp4_expert_sources_parallel",
+    "setup_offload_expert_banks",
     "parse_gguf_config",
     "iter_gguf_weights",
     "load_q4_0_expert_sources",

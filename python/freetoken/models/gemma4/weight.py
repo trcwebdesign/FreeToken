@@ -9,6 +9,7 @@ from freetoken.distributed import get_tp_info
 from freetoken.models.config import FullAttentionGroupConfig
 from freetoken.models.loader import (
     MergeRule,
+    ShardReader,
     drop_page_cache,
     iter_weight_files,
 )
@@ -39,6 +40,10 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     layer_to_bank=lambda layer, config: layer,  # every layer is MoE (no dense prefix)
     desc="Gemma4 NVFP4 experts",
 )
+_CT_FP8_EXPERT_KEY_RE = re.compile(
+    r"^model\.language_model\.layers\.(?P<layer>\d+)\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale)$"
+)
 _LAYER_INDEX_PATTERN = re.compile(r"layers\.(\d+)\.")
 _LAYER_FF_PREFIX_PATTERN = re.compile(r"^(model\.layers\.\d+)\.")
 _MERGE_RULES = {
@@ -64,6 +69,7 @@ _FEED_FORWARD_PREFIXES = (
 # qwen3_5_moe native-NVFP4 dense loader.
 _NVFP4_DENSE_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
 _NVFP4_DENSE_MLP_RE = re.compile(r"\.mlp\.(gate_proj|up_proj|down_proj)\.weight$")
+_CT_FP8_SCALE_SUFFIX = ".weight_scale"
 
 
 def _nvfp4_dense_parts(f, raw_base: str):
@@ -80,6 +86,18 @@ def _nvfp4_dense_parts(f, raw_base: str):
         and g.dtype is torch.float16
     ), f"unexpected NVFP4 dense dtypes at {raw_base}: {w.dtype}/{s.dtype}/{g.dtype}"
     return w, s, g
+
+
+def _dequant_ct_fp8_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize compressed-tensors channel-wise FP8 weights to BF16."""
+    if scale.numel() == weight.shape[0]:
+        scale = scale.reshape(weight.shape[0], 1)
+    elif scale.numel() != 1:
+        raise ValueError(
+            f"unexpected Gemma compressed-tensors scale shape {tuple(scale.shape)} "
+            f"for weight shape {tuple(weight.shape)}"
+        )
+    return weight.to(torch.bfloat16) * scale.to(torch.bfloat16)
 
 
 def _emit_nvfp4_dense_mlp(f, base: str, raw_base: str, buf: dict):
@@ -166,80 +184,103 @@ def iter_weights(
     }
     merge_buf: dict[str, dict[str, torch.Tensor]] = {}
     gateup_buf: dict[str, dict[str, tuple]] = {}
-    for file in tqdm(
-        iter_weight_files(model_path),
-        desc="Loading weights",
-        disable=not tp_info.is_primary(),
-    ):
-        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
-            keyset = set(f.keys())
-            for raw_name in f.keys():
-                name = rename_key(raw_name, include_vision=include_vision)
-                if name is None:
-                    continue
+    ct_reader = ShardReader(model_path, device) if config.expert_quant == "compressed-tensors" else None
+    files = ct_reader.files() if ct_reader is not None else iter_weight_files(model_path)
+    try:
+        for file in tqdm(
+            files,
+            desc="Loading weights",
+            disable=not tp_info.is_primary(),
+        ):
+            names = ct_reader.names_in(file) if ct_reader is not None else None
+            with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+                keyset = set(names if names is not None else f.keys())
+                for raw_name in keyset:
+                    name = rename_key(raw_name, include_vision=include_vision)
+                    if name is None:
+                        continue
 
-                # Per-expert NVFP4 tensors go to the offload cache (load_nvfp4_expert_sources),
-                # not this dense pass; fused bf16/q4_0 experts lack ".experts.<int>." so are unaffected.
-                if _NVFP4_EXPERT_RE.search(raw_name):
-                    continue
+                    # Per-expert NVFP4 tensors go to the offload cache (load_nvfp4_expert_sources),
+                    # not this dense pass; fused bf16/q4_0 experts lack ".experts.<int>." so are unaffected.
+                    if _NVFP4_EXPERT_RE.search(raw_name):
+                        continue
 
-                # NVFP4 dense-MLP scales are consumed with their .weight (below), never yielded.
-                if raw_name.endswith(_NVFP4_DENSE_SCALE_SUFFIXES):
-                    continue
+                    if config.expert_quant == "compressed-tensors":
+                        if raw_name.endswith(_CT_FP8_SCALE_SUFFIX):
+                            continue
+                        if raw_name.endswith(".weight"):
+                            scale_name = raw_name.removesuffix(".weight") + _CT_FP8_SCALE_SUFFIX
+                            try:
+                                tensor = _dequant_ct_fp8_weight(
+                                    ct_reader.get_tensor(raw_name),
+                                    ct_reader.get_tensor(scale_name),
+                                )
+                            except KeyError:
+                                tensor = f.get_tensor(raw_name)
+                        else:
+                            tensor = f.get_tensor(raw_name)
+                    else:
+                        tensor = f.get_tensor(raw_name)
 
-                is_vision = name.startswith(("vision_tower.", "embed_vision."))
-                is_expert = (
-                    not is_vision and _PACKED_EXPERT_PATTERN.match(name) is not None
-                )
-                if is_expert and not include_moe_experts:
-                    continue
-                if not is_expert and not include_non_moe:
-                    continue
+                    # NVFP4 dense-MLP scales are consumed with their .weight (below), never yielded.
+                    if raw_name.endswith(_NVFP4_DENSE_SCALE_SUFFIXES):
+                        continue
 
-                # Native W4A16 NVFP4 dense MLP: the .weight is FP4-packed and carries block +
-                # per-tensor scales. The keyset guard (weight_scale_2 sibling present) is
-                # defense-in-depth beyond config.dense_quant -- the sibling MoE checkpoint's
-                # bf16 shared_mlp has no such sibling, so it falls through to the bf16 path.
-                if (
-                    config.dense_quant == "nvfp4"
-                    and not is_vision
-                    and not is_expert
-                    and _NVFP4_DENSE_MLP_RE.search(raw_name)
-                    and raw_name[: -len(".weight")] + ".weight_scale_2" in keyset
-                ):
-                    yield from _emit_nvfp4_dense_mlp(
-                        f, name[: -len(".weight")], raw_name[: -len(".weight")], gateup_buf
+                    is_vision = name.startswith(("vision_tower.", "embed_vision."))
+                    is_expert = (
+                        not is_vision and _PACKED_EXPERT_PATTERN.match(name) is not None
                     )
-                    continue
+                    if is_expert and not include_moe_experts:
+                        continue
+                    if not is_expert and not include_non_moe:
+                        continue
 
-                tensor = f.get_tensor(raw_name)
-                if is_vision or is_expert:
-                    yield name, tensor
-                    continue
-
-                info = merge_info(name)
-                if info is None:
-                    yield name, tensor
-                    continue
-
-                merged_key, rule = info
-                slots = merge_buf.setdefault(merged_key, {})
-                slots[rule.slot] = tensor
-                if rule.slot == "k" and k_eq_v_layers:
-                    layer_match = _LAYER_INDEX_PATTERN.search(name)
+                    # Native W4A16 NVFP4 dense MLP: the .weight is FP4-packed and carries block +
+                    # per-tensor scales. The keyset guard (weight_scale_2 sibling present) is
+                    # defense-in-depth beyond config.dense_quant -- the sibling MoE checkpoint's
+                    # bf16 shared_mlp has no such sibling, so it falls through to the bf16 path.
                     if (
-                        layer_match is not None
-                        and int(layer_match.group(1)) in k_eq_v_layers
+                        config.dense_quant == "nvfp4"
+                        and not is_vision
+                        and not is_expert
+                        and _NVFP4_DENSE_MLP_RE.search(raw_name)
+                        and raw_name[: -len(".weight")] + ".weight_scale_2" in keyset
                     ):
-                        slots["v"] = tensor
-                if not all(slot in slots for slot in rule.slots):
-                    continue
-                parts = [slots[slot] for slot in rule.slots]
-                del merge_buf[merged_key]
-                yield merged_key, torch.cat(parts, dim=0)
+                        yield from _emit_nvfp4_dense_mlp(
+                            f, name[: -len(".weight")], raw_name[: -len(".weight")], gateup_buf
+                        )
+                        continue
 
-    assert not merge_buf, f"Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"
-    assert not gateup_buf, f"Incomplete NVFP4 gate/up merges: {list(gateup_buf.keys())}"
+                    if is_vision or is_expert:
+                        yield name, tensor
+                        continue
+
+                    info = merge_info(name)
+                    if info is None:
+                        yield name, tensor
+                        continue
+
+                    merged_key, rule = info
+                    slots = merge_buf.setdefault(merged_key, {})
+                    slots[rule.slot] = tensor
+                    if rule.slot == "k" and k_eq_v_layers:
+                        layer_match = _LAYER_INDEX_PATTERN.search(name)
+                        if (
+                            layer_match is not None
+                            and int(layer_match.group(1)) in k_eq_v_layers
+                        ):
+                            slots["v"] = tensor
+                    if not all(slot in slots for slot in rule.slots):
+                        continue
+                    parts = [slots[slot] for slot in rule.slots]
+                    del merge_buf[merged_key]
+                    yield merged_key, torch.cat(parts, dim=0)
+
+        assert not merge_buf, f"Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"
+        assert not gateup_buf, f"Incomplete NVFP4 gate/up merges: {list(gateup_buf.keys())}"
+    finally:
+        if ct_reader is not None:
+            ct_reader.close()
 
 
 def iter_weights_parallel(
@@ -279,6 +320,10 @@ def load_nvfp4_expert_sources(
     model_path: str, config, *, layer_sink=None
 ) -> dict[str, list[torch.Tensor]]:
     """CPU NVFP4 expert source banks for the offload cache; see load_nvfp4_expert_source_banks."""
+    if model_path.endswith(".gguf"):
+        from .gguf import load_nvfp4_expert_sources as load_gguf_nvfp4_expert_sources
+
+        return load_gguf_nvfp4_expert_sources(model_path, config, layer_sink=layer_sink)
     return load_nvfp4_expert_source_banks(
         model_path,
         config,
@@ -307,9 +352,122 @@ def load_nvfp4_expert_sources_parallel(
     )
 
 
+def _load_ct_fp8_expert_banks(model_path: str, config, *, layer_sink=None):
+    from freetoken.moe.expert_banks import ExpertBanks
+    from freetoken.moe.host_banks import LayerCompletionTracker, alloc_layer_banks, pin_banks
+
+    L, E, H, I = (
+        config.num_layers,
+        config.num_experts,
+        config.hidden_size,
+        config.moe_intermediate_size,
+    )
+    banks = alloc_layer_banks(
+        {
+            "gate_up": ((E, 2 * I, H), torch.bfloat16),
+            "down": ((E, H, I), torch.bfloat16),
+        },
+        L,
+    )
+    tracker = LayerCompletionTracker(2, banks, layer_sink) if layer_sink is not None else None
+    seen: set[tuple[int, int, str]] = set()
+    primary = get_tp_info().is_primary()
+
+    reader = ShardReader(model_path, torch.device("cpu"))
+    try:
+        for file in tqdm(
+            reader.files(),
+            desc="Loading Gemma compressed-tensors FP8 experts",
+            disable=not primary,
+        ):
+            for raw_name in reader.names_in(file):
+                match = _CT_FP8_EXPERT_KEY_RE.match(raw_name)
+                if match is None or match["kind"] != "weight":
+                    continue
+                layer = int(match["layer"])
+                expert = int(match["expert"])
+                proj = match["proj"]
+                base = raw_name.removesuffix(".weight")
+                scale_name = base + ".weight_scale"
+                try:
+                    scale = reader.get_tensor(scale_name)
+                except KeyError as exc:
+                    raise ValueError(f"missing scale tensor {scale_name!r}") from exc
+                value = _dequant_ct_fp8_weight(reader.get_tensor(raw_name), scale)
+                if proj == "gate_proj":
+                    banks["gate_up"][layer].tensor[expert, :I].copy_(value)
+                elif proj == "up_proj":
+                    banks["gate_up"][layer].tensor[expert, I:].copy_(value)
+                else:
+                    banks["down"][layer].tensor[expert].copy_(value)
+                seen.add((layer, expert, proj))
+    finally:
+        reader.close()
+
+    expected = {(layer, expert, proj) for layer in range(L) for expert in range(E)
+                for proj in ("gate_proj", "up_proj", "down_proj")}
+    missing = expected - seen
+    if missing:
+        raise ValueError(f"missing Gemma compressed-tensors expert weights: {sorted(missing)[:4]}")
+
+    if tracker is not None:
+        for layer in range(L):
+            tracker.note(layer)
+            tracker.note(layer)
+    else:
+        pin_banks(banks)
+    return ExpertBanks(
+        "bf16",
+        {name: [bank.tensor for bank in layer_banks] for name, layer_banks in banks.items()},
+        streamed=layer_sink is not None,
+    )
+
+
+def setup_offload_expert_banks(
+    model_path: str,
+    model_config,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    dummy: bool = False,
+    parallel: bool = False,
+    workers: int = 8,
+    chunk: int = 8 << 20,
+    decode_target: str = "gpu",
+    layer_sink=None,
+):
+    """Load Gemma's compressed-tensors per-channel FP8 experts as BF16 banks."""
+    from freetoken.moe.expert_banks import ExpertBanks
+
+    if getattr(model_config, "expert_quant", "none") == "compressed-tensors":
+        if dummy:
+            from freetoken.models.weight import dummy_moe_expert_sources
+
+            gate_up, down = dummy_moe_expert_sources(model_config, dtype=torch.bfloat16)
+            return ExpertBanks("bf16", {"gate_up": gate_up, "down": down})
+        return _load_ct_fp8_expert_banks(model_path, model_config, layer_sink=layer_sink)
+
+    from freetoken.moe.expert_banks import _PROVIDERS
+
+    provider = _PROVIDERS[model_config.expert_quant]
+    return provider(
+        model_path,
+        model_config,
+        device,
+        dtype,
+        dummy,
+        parallel=parallel,
+        workers=workers,
+        chunk=chunk,
+        decode_target=decode_target,
+        layer_sink=layer_sink,
+    )
+
+
 __all__ = [
     "iter_weights",
     "iter_weights_parallel",
     "load_nvfp4_expert_sources",
     "load_nvfp4_expert_sources_parallel",
+    "setup_offload_expert_banks",
 ]
