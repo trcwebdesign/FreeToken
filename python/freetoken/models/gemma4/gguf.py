@@ -95,6 +95,20 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     )
 
     hf_nvfp4 = shim.is_hf_nvfp4
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    embedding_bf16 = any(
+        t.name == "model.language_model.embed_tokens.weight" and t.ggml_type != 40
+        for t in iter_gguf_tensors(shim.model_path)
+    )
+    router_bf16 = any(
+        t.name.endswith(".router.proj.weight") and t.ggml_type != 40
+        for t in iter_gguf_tensors(shim.model_path)
+    )
+    dense_bf16 = any(
+        t.name.endswith(".self_attn.q_proj.weight") and t.ggml_type != 40
+        for t in iter_gguf_tensors(shim.model_path)
+    )
     return ModelConfig(
         num_layers=num_layers,
         num_qo_heads=num_qo_heads,
@@ -116,6 +130,9 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         moe_enabled=True,
         expert_quant="nvfp4" if hf_nvfp4 else "q4_0",
         moe_weight_format="nvfp4" if hf_nvfp4 else "q4_0",
+        gguf_embedding_bf16=embedding_bf16,
+        gguf_router_bf16=router_bf16,
+        gguf_dense_bf16=dense_bf16,
         use_qk_norm=True,
         attn_sm_scale=1.0,
         final_logit_softcapping=float(g("final_logit_softcapping")),
@@ -359,8 +376,6 @@ def _iter_hf_nvfp4_weights(model_path, device, include_moe_experts, include_non_
         if global_name in by_name:
             global_scale = _to_bf16(by_name[global_name]).reshape(-1)
         else:
-            # GGML's embedding tensor already has its complete per-block scale and
-            # intentionally has no separate ModelOpt-style global scale.
             global_scale = torch.ones(packed.shape[0], dtype=torch.float16)
         # FreeToken's E4M3 decoder uses the full-scale representation, so the
         # standard E2M1 LUT and GGML's doubled-code convention already cancel out.
@@ -380,7 +395,28 @@ def _iter_hf_nvfp4_weights(model_path, device, include_moe_experts, include_non_
             continue
         if t.ggml_type != GGML_NVFP4:
             if include_non_moe and ".experts." not in name:
-                yield rename(name), _to_bf16(t).to(device)
+                key = rename(name)
+                tensor = _to_bf16(t).to(device)
+                scale_name = name.removesuffix(".weight") + ".weight_scale"
+                if name.endswith(".weight") and scale_name in by_name:
+                    scale = _to_bf16(by_name[scale_name]).to(device=device, dtype=tensor.dtype)
+                    tensor = tensor * scale.reshape(-1, 1)
+                if key.endswith((".q_proj.weight", ".k_proj.weight", ".v_proj.weight")):
+                    slot = key.rsplit(".", 2)[-2][0]
+                    fused = key.rsplit(".", 2)[0] + ".qkv_proj.weight"
+                    merge.setdefault(fused, {})[slot] = (tensor, None, None)
+                    if all(x in merge[fused] for x in "qkv"):
+                        parts = merge.pop(fused)
+                        yield fused, torch.cat([parts[x][0] for x in "qkv"])
+                elif key.endswith((".gate_proj.weight", ".up_proj.weight")):
+                    slot = "gate" if key.endswith(".gate_proj.weight") else "up"
+                    fused = key.rsplit(".", 2)[0] + ".gate_up_proj.weight"
+                    merge.setdefault(fused, {})[slot] = (tensor, None, None)
+                    if all(x in merge[fused] for x in ("gate", "up")):
+                        parts = merge.pop(fused)
+                        yield fused, torch.cat([parts[x][0] for x in ("gate", "up")])
+                else:
+                    yield key, tensor
             continue
         if not name.endswith(".weight"):
             continue
@@ -398,28 +434,20 @@ def _iter_hf_nvfp4_weights(model_path, device, include_moe_experts, include_non_
             merge.setdefault(fused, {})[slot] = emit(name, packed, scales)
             if all(slot in merge[fused] for slot in "qkv"):
                 parts = merge.pop(fused)
-                yield from state(
-                    fused,
-                    (
-                        torch.cat([parts[x][0] for x in "qkv"]),
-                        torch.cat([parts[x][1] for x in "qkv"]),
-                        torch.cat([parts[x][2] for x in "qkv"]),
-                    ),
-                )
+                if parts["q"][1] is None:
+                    yield fused, torch.cat([parts[x][0] for x in "qkv"])
+                else:
+                    yield from state(fused, (torch.cat([parts[x][0] for x in "qkv"]), torch.cat([parts[x][1] for x in "qkv"]), torch.cat([parts[x][2] for x in "qkv"])))
         elif key.endswith((".gate_proj.weight", ".up_proj.weight")):
             slot = "gate" if key.endswith(".gate_proj.weight") else "up"
             fused = key.rsplit(".", 2)[0] + ".gate_up_proj.weight"
             merge.setdefault(fused, {})[slot] = emit(name, packed, scales)
             if all(slot in merge[fused] for slot in ("gate", "up")):
                 parts = merge.pop(fused)
-                yield from state(
-                    fused,
-                    (
-                        torch.cat([parts[x][0] for x in ("gate", "up")]),
-                        torch.cat([parts[x][1] for x in ("gate", "up")]),
-                        torch.cat([parts[x][2] for x in ("gate", "up")]),
-                    ),
-                )
+                if parts["gate"][1] is None:
+                    yield fused, torch.cat([parts[x][0] for x in ("gate", "up")])
+                else:
+                    yield from state(fused, (torch.cat([parts[x][0] for x in ("gate", "up")]), torch.cat([parts[x][1] for x in ("gate", "up")]), torch.cat([parts[x][2] for x in ("gate", "up")])))
         elif key.endswith(".down_proj.weight") or key.endswith(".weight"):
             yield from state(key, emit(name, packed, scales))
     for fused, parts in list(merge.items()):
@@ -428,15 +456,11 @@ def _iter_hf_nvfp4_weights(model_path, device, include_moe_experts, include_non_
             if not swa_pattern[layer] and set(parts) == {"q", "k"}:
                 parts["v"] = parts["k"]
                 del merge[fused]
-                yield from state(
-                    fused,
-                    (
-                        torch.cat([parts[x][0] for x in "qkv"]),
-                        torch.cat([parts[x][1] for x in "qkv"]),
-                        torch.cat([parts[x][2] for x in "qkv"]),
-                    ),
-                )
-    assert not merge, f"incomplete HF NVFP4 groups: {sorted(merge)}"
+                if parts["q"][1] is None:
+                    yield fused, torch.cat([parts[x][0] for x in "qkv"])
+                else:
+                    yield from state(fused, (torch.cat([parts[x][0] for x in "qkv"]), torch.cat([parts[x][1] for x in "qkv"]), torch.cat([parts[x][2] for x in "qkv"])))
+    assert not merge, f"incomplete HF mixed groups: {sorted(merge)}"
 
 
 # --------------------------------------------------------------------------------------
@@ -544,17 +568,32 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
         from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged, Nvfp4DenseLinear
 
         inner = model.model
-        embed = Nvfp4Embedding(config.vocab_size, config.hidden_size, config.embedding_scale)
-        inner.embed_tokens = embed
-        for layer in inner.layers.op_list:
-            layer.self_attn.qkv_proj = Nvfp4DenseColMerged(
+        if config.gguf_embedding_bf16:
+            from freetoken.layers import ParallelLMHead, VocabParallelEmbedding
+
+            embed = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size, config.embedding_scale
+            )
+            inner.embed_tokens = embed
+            model.lm_head = ParallelLMHead(
+                config.vocab_size,
                 config.hidden_size,
-                [layer.self_attn.q_dim, layer.self_attn.kv_dim, layer.self_attn.kv_dim],
+                tie_word_embeddings=True,
+                tied_embedding=embed,
             )
-            layer.self_attn.o_proj = Nvfp4DenseLinear(
-                layer.self_attn.q_dim, config.hidden_size
-            )
-        model.lm_head = Nvfp4TiedLMHead(embed)
+        else:
+            embed = Nvfp4Embedding(config.vocab_size, config.hidden_size, config.embedding_scale)
+            inner.embed_tokens = embed
+            model.lm_head = Nvfp4TiedLMHead(embed)
+        if not config.gguf_dense_bf16:
+            for layer in inner.layers.op_list:
+                layer.self_attn.qkv_proj = Nvfp4DenseColMerged(
+                    config.hidden_size,
+                    [layer.self_attn.q_dim, layer.self_attn.kv_dim, layer.self_attn.kv_dim],
+                )
+                layer.self_attn.o_proj = Nvfp4DenseLinear(
+                    layer.self_attn.q_dim, config.hidden_size
+                )
         return
 
     from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear

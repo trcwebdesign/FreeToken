@@ -16,7 +16,10 @@ class Gemma4Router(BaseOP):
 
     def __init__(self, config: ModelConfig):
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, with_scale=False)
-        if getattr(config, "moe_weight_format", None) == "nvfp4":
+        if (
+            getattr(config, "moe_weight_format", None) == "nvfp4"
+            and not getattr(config, "gguf_router_bf16", False)
+        ):
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseLinear
 
             self.proj = Nvfp4DenseLinear(config.hidden_size, config.num_experts, has_bias=False)
@@ -48,6 +51,7 @@ class Gemma4MLP(BaseOP):
         self.shared_mlp = (
             _Nvfp4GatedMLP(config)
             if getattr(config, "moe_weight_format", None) == "nvfp4"
+            and not getattr(config, "gguf_dense_bf16", False)
             else GatedMLP(config)
         )
         self.experts = make_moe_layer(

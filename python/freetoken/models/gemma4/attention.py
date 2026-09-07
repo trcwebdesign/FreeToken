@@ -31,7 +31,10 @@ class Gemma4Attention(BaseOP):
 
         self.q_dim = self.num_qo_heads * self.head_dim
         self.kv_dim = self.num_kv_heads * self.head_dim
-        if getattr(config, "moe_weight_format", None) == "nvfp4":
+        if (
+            getattr(config, "moe_weight_format", None) == "nvfp4"
+            and not getattr(config, "gguf_dense_bf16", False)
+        ):
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged, Nvfp4DenseLinear
 
             self.qkv_proj = Nvfp4DenseColMerged(

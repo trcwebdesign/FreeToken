@@ -99,7 +99,7 @@ def source_metadata(config_path: Path, tokenizer_path: Path, chat_template_path:
     merges = [" ".join(item) if isinstance(item, list) else item for item in merges]
     chat_template = chat_template_path.read_text(encoding="utf-8")
 
-    return {
+    metadata = {
         "general.architecture": "gemma4",
         "general.alignment": ALIGNMENT,
         "general.name": config.get("_name_or_path", "Gemma 4"),
@@ -134,6 +134,16 @@ def source_metadata(config_path: Path, tokenizer_path: Path, chat_template_path:
         "tokenizer.ggml.padding_token_id": 0,
         "tokenizer.chat_template": chat_template,
     }
+    generation_path = config_path.with_name("generation_config.json")
+    if generation_path.exists():
+        generation = json.loads(generation_path.read_text(encoding="utf-8"))
+        if generation.get("temperature") is not None:
+            metadata["general.sampling.temp"] = float(generation["temperature"])
+        if generation.get("top_k") is not None:
+            metadata["general.sampling.top_k"] = int(generation["top_k"])
+        if generation.get("top_p") is not None:
+            metadata["general.sampling.top_p"] = float(generation["top_p"])
+    return metadata
 
 
 def repair(source: Path, output: Path, metadata: dict[str, object]) -> None:
