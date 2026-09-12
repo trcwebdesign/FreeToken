@@ -37,7 +37,10 @@ class GgufConfigShim:
         if self.metadata.get(GGUF_FORMAT_KV) == "hf_nvfp4":
             return True
         return (
-            "model.language_model.embed_tokens.weight" in gguf_tensor_names(self.model_path)
+            (
+                "model.language_model.embed_tokens.weight" in gguf_tensor_names(self.model_path)
+                or "token_embd.weight" in gguf_tensor_names(self.model_path)
+            )
             and any(int(t.tensor_type) == GGML_NVFP4 for t in _reader(self.model_path).tensors)
         )
 

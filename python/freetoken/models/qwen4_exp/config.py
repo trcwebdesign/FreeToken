@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from fnmatch import fnmatch
 from typing import Any, Tuple
 
 import torch
 
+from freetoken.layers.quantization import QuantConfig
 from freetoken.models.config import (
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
@@ -92,17 +92,6 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
             fill_value=float(args.ngram_boundary_token_id),
         ),
     )
-
-
-def _quant_get(hf_config: Any):
-    quant = getattr(hf_config, "quantization_config", None)
-    if quant is None:
-        return None
-    return quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
-
-
-def _ignored(patterns, module_name: str) -> bool:
-    return any(fnmatch(module_name, pat) for pat in patterns)
 
 
 def _layer_types(text: Any) -> list[str]:
@@ -208,6 +197,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
 
+    # the engine reads this flag for its MoE strategy decisions; every module takes its own scheme from the QuantConfig when it is built
+    expert_scheme = QuantConfig.from_hf(hf_config).scheme_for_name("model.language_model.layers.0.mlp.experts.0.gate_proj")
+    expert_quant = "none" if expert_scheme is None else str(expert_scheme.kind)
+
     # HF stores ple_layer_ids one-indexed (validated upstream as [1, num_layers]).
     ple_layer_ids = tuple(int(i) - 1 for i in (getattr(text, "ple_layer_ids", None) or ()))
     for lid in ple_layer_ids:
@@ -307,9 +300,6 @@ def parse_config(hf_config: Any) -> ModelConfig:
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,
-        attn_quant=attn_quant,
-        dense_quant=dense_quant,
-        lm_head_quant=lm_head_quant,
         qwen4_args=qwen4_args,
         slot_states=ple_slot_states(qwen4_args),
     )

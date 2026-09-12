@@ -98,15 +98,24 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     from freetoken.models.gguf.reader import iter_gguf_tensors
 
     embedding_bf16 = any(
-        t.name == "model.language_model.embed_tokens.weight" and t.ggml_type != 40
+        t.name in {"model.language_model.embed_tokens.weight", "token_embd.weight"}
+        and t.ggml_type != 40
         for t in iter_gguf_tensors(shim.model_path)
     )
     router_bf16 = any(
-        t.name.endswith(".router.proj.weight") and t.ggml_type != 40
+        (
+            t.name.endswith(".router.proj.weight")
+            or t.name.endswith(".ffn_gate_inp.weight")
+        )
+        and t.ggml_type != 40
         for t in iter_gguf_tensors(shim.model_path)
     )
     dense_bf16 = any(
-        t.name.endswith(".self_attn.q_proj.weight") and t.ggml_type != 40
+        (
+            t.name.endswith(".self_attn.q_proj.weight")
+            or t.name.endswith(".attn_q.weight")
+        )
+        and t.ggml_type != 40
         for t in iter_gguf_tensors(shim.model_path)
     )
     return ModelConfig(
@@ -225,7 +234,13 @@ def iter_gguf_weights(
     from freetoken.models.gguf.reader import gguf_tensor_names
 
     tensor_names = gguf_tensor_names(model_path)
-    if "model.language_model.embed_tokens.weight" in tensor_names:
+    if (
+        "model.language_model.embed_tokens.weight" in tensor_names
+        or (
+            "token_embd.weight" in tensor_names
+            and any(t.ggml_type == GGML_NVFP4 for t in iter_gguf_tensors(model_path))
+        )
+    ):
         yield from _iter_hf_nvfp4_weights(model_path, device, include_moe_experts, include_non_moe)
         return
 
@@ -353,6 +368,30 @@ def _iter_hf_nvfp4_weights(model_path, device, include_moe_experts, include_non_
     swa_pattern = [bool(x) for x in metadata["gemma4.attention.sliding_window_pattern"]]
 
     def rename(name: str) -> str:
+        if name == "token_embd.weight":
+            return "model.embed_tokens.weight"
+        if name == "output_norm.weight":
+            return "model.norm.weight"
+        if name.startswith("blk."):
+            _, layer, suffix = name.split(".", 2)
+            layer_prefix = f"model.layers.{layer}"
+            legacy_map = {
+                "attn_q.weight": "self_attn.q_proj.weight",
+                "attn_k.weight": "self_attn.k_proj.weight",
+                "attn_v.weight": "self_attn.v_proj.weight",
+                "attn_output.weight": "self_attn.o_proj.weight",
+                "ffn_gate.weight": "feed_forward.shared_mlp.gate_proj.weight",
+                "ffn_up.weight": "feed_forward.shared_mlp.up_proj.weight",
+                "ffn_down.weight": "feed_forward.shared_mlp.down_proj.weight",
+                "ffn_gate_inp.weight": "feed_forward.router.proj.weight",
+            }
+            if suffix in legacy_map:
+                return f"{layer_prefix}.{legacy_map[suffix]}"
+            if suffix in _LAYER_SCALAR_MAP:
+                return f"{layer_prefix}.{_LAYER_SCALAR_MAP[suffix]}"
+            if suffix.endswith("_exps.weight"):
+                return f"{layer_prefix}.feed_forward.experts.{suffix}"
+            return f"{layer_prefix}.{suffix}"
         name = name.removeprefix("model.language_model.")
         name = "model." + name
         marker = ".layers."
@@ -389,7 +428,11 @@ def _iter_hf_nvfp4_weights(model_path, device, include_moe_experts, include_non_
 
     for t in tensors:
         name = t.name
-        if not name.startswith("model.language_model."):
+        if not (
+            name.startswith("model.language_model.")
+            or name.startswith("blk.")
+            or name in {"token_embd.weight", "output_norm.weight"}
+        ):
             continue
         if name.endswith(".weight_scale") or name.endswith(".weight_scale_2"):
             continue
@@ -722,7 +765,20 @@ def load_nvfp4_expert_sources(
     )
     banks = {name: [bank.tensor for bank in layers] for name, layers in hb.items()}
     tensors = {t.name: t for t in iter_gguf_tensors(model_path)}
+    legacy = "blk.0.ffn_gate_up_exps.weight" in tensors
     for layer in range(L):
+        if legacy:
+            gate_up, gate_up_scales = _nvfp4_parts(tensors[f"blk.{layer}.ffn_gate_up_exps.weight"])
+            down, down_scales = _nvfp4_parts(tensors[f"blk.{layer}.ffn_down_exps.weight"])
+            gate_up_global = torch.ones(2 * I, dtype=torch.float16)
+            down_global = torch.ones(H, dtype=torch.float16)
+            banks["gate_up_packed"][layer].copy_(gate_up.reshape(E, 2 * I, H // 2))
+            banks["gate_up_scale"][layer].copy_(gate_up_scales.reshape(E, 2 * I, H // 16))
+            banks["gate_up_global"][layer].copy_(gate_up_global.expand(E, -1))
+            banks["down_packed"][layer].copy_(down.reshape(E, H, I // 2))
+            banks["down_scale"][layer].copy_(down_scales.reshape(E, H, I // 16))
+            banks["down_global"][layer].copy_(down_global.expand(E, -1))
+            continue
         for expert in range(E):
             parts = {}
             for projection in ("gate_proj", "up_proj", "down_proj"):

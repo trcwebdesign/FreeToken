@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 class Gemma4Attention(BaseOP):
     """Gemma 4 attention for one full-context or SWA layer."""
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         self.layer_id = layer_id
         group = config.attention_group_for_layer(layer_id)
         self.is_swa = isinstance(group, SWAAttentionGroupConfig)
