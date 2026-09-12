@@ -280,38 +280,11 @@ def iter_weights(
                     yield merged_key, torch.cat(parts, dim=0)
 
     finally:
-        reader.close()
-
-    assert not merge_buf, f"Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"
-    assert not gateup_buf, f"Incomplete NVFP4 gate/up merges: {list(gateup_buf.keys())}"
-
-                    info = merge_info(name)
-                    if info is None:
-                        yield name, tensor
-                        continue
-
-                    merged_key, rule = info
-                    slots = merge_buf.setdefault(merged_key, {})
-                    slots[rule.slot] = tensor
-                    if rule.slot == "k" and k_eq_v_layers:
-                        layer_match = _LAYER_INDEX_PATTERN.search(name)
-                        if (
-                            layer_match is not None
-                            and int(layer_match.group(1)) in k_eq_v_layers
-                        ):
-                            slots["v"] = tensor
-                    if not all(slot in slots for slot in rule.slots):
-                        continue
-                    parts = [slots[slot] for slot in rule.slots]
-                    del merge_buf[merged_key]
-                    yield merged_key, torch.cat(parts, dim=0)
-
-        assert not merge_buf, f"Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"
-        assert not gateup_buf, f"Incomplete NVFP4 gate/up merges: {list(gateup_buf.keys())}"
-    finally:
         if ct_reader is not None:
             ct_reader.close()
 
+    assert not merge_buf, f"Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"
+    assert not gateup_buf, f"Incomplete NVFP4 gate/up merges: {list(gateup_buf.keys())}"
 
 def iter_weights_parallel(
     model_path: str,
