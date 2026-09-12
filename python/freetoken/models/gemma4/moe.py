@@ -47,7 +47,7 @@ class Gemma4Router(BaseOP):
 class Gemma4MLP(BaseOP):
     """Gemma 4 feed-forward sandwich: shared MLP plus routed MoE branch."""
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         self.shared_mlp = (
             _Nvfp4GatedMLP(config)
             if getattr(config, "moe_weight_format", None) == "nvfp4"

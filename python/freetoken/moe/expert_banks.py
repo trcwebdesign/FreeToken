@@ -172,9 +172,26 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
+def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for nvfp4 GGUF: use the GGUF-native reader"
+        )
+    from freetoken.models.gemma4.gguf import load_nvfp4_expert_sources
+
+    sources = load_nvfp4_expert_sources(
+        model_path, model_config, layer_sink=None if dummy else layer_sink
+    )
+    return ExpertBanks(
+        "nvfp4", {name: sources[name] for name in _BANK_SCHEMAS["nvfp4"]},
+        streamed=layer_sink is not None and not dummy,
+    )
+
+
 # expert formats that still load through their own provider (GGUF)
 _PROVIDERS = {
     "q4_0": _q4_0_banks,
+    "nvfp4": _nvfp4_banks,
 }
 
 

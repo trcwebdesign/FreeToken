@@ -929,6 +929,9 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     """
 
     global _GLOBAL_STATE, _MODEL_SAMPLING
+    if os.name == "nt":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 
     if config.sampling_defaults == "model" and not config.use_dummy_weight:
         _MODEL_SAMPLING = load_generation_sampling(config.model_path)

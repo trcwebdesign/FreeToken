@@ -426,7 +426,31 @@ class OffloadMoELayer(MoELayer):
             return fused_experts_gguf_q4_0(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
-        raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
+        if fmt == "nvfp4":
+            from freetoken.moe.fused_nvfp4 import (
+                fused_experts_decode_nvfp4_marlin,
+                fused_experts_nvfp4,
+            )
+
+            if is_prefill:
+                return fused_experts_nvfp4(
+                    hidden_states,
+                    *views,
+                    topk_weights,
+                    topk_ids,
+                    self.num_experts,
+                    self.activation,
+                    self.apply_router_weight_on_input,
+                )
+            return fused_experts_decode_nvfp4_marlin(
+                hidden_states,
+                *views,
+                topk_weights,
+                topk_ids,
+                self.activation,
+                self.apply_router_weight_on_input,
+            )
+        raise AssertionError(f"offload experts without a quant method only serve q4_0/nvfp4 banks, got {fmt!r}")
 
 
 def make_moe_layer(

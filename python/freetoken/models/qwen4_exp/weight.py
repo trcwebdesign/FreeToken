@@ -545,6 +545,10 @@ def load_nvfp4_expert_sources_parallel(
     )
 
 
+def nvfp4_expert_spec(model_path: str, config):
+    return _NVFP4_SOURCE_SPEC
+
+
 __all__ = [
     "nvfp4_expert_spec",
     "PleTable",
