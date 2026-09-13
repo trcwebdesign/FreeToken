@@ -168,7 +168,7 @@ def iter_weights(
 
     def merge_info(key: str) -> tuple[str, MergeRule] | None:
         for suffix, rule in _MERGE_RULES.items():
-            if key.endswith(suffix + ".weight") or key.endswith(suffix):
+            if key.endswith(suffix + ".weight") or key.endswith(suffix + ".weight_scale") or key.endswith(suffix):
                 return key.replace(suffix, rule.fused_suffix), rule
         return None
 
@@ -208,24 +208,28 @@ def iter_weights(
                         continue
 
                     if config.expert_quant == "compressed-tensors":
-                        if raw_name.endswith(_CT_FP8_SCALE_SUFFIX):
+                        # Dense Linear layers use the FP8 quant method and must retain the
+                        # raw FP8 weight plus its scale. Routed Gemma experts bypass that
+                        # method and are dequantized into the BF16 offload banks instead.
+                        is_ct_expert = _CT_FP8_EXPERT_KEY_RE.match(raw_name) is not None
+                        is_shared_mlp = ".feed_forward.shared_mlp." in name
+                        if (is_ct_expert or is_shared_mlp) and raw_name.endswith(_CT_FP8_SCALE_SUFFIX):
                             continue
-                        if raw_name.endswith(".weight"):
+                        if (is_ct_expert or is_shared_mlp) and raw_name.endswith(".weight"):
                             scale_name = raw_name.removesuffix(".weight") + _CT_FP8_SCALE_SUFFIX
-                            try:
-                                tensor = _dequant_ct_fp8_weight(
-                                    ct_reader.get_tensor(raw_name),
-                                    ct_reader.get_tensor(scale_name),
-                                )
-                            except KeyError:
-                                tensor = f.get_tensor(raw_name)
+                            tensor = _dequant_ct_fp8_weight(
+                                ct_reader.get_tensor(raw_name),
+                                ct_reader.get_tensor(scale_name),
+                            )
                         else:
                             tensor = f.get_tensor(raw_name)
+                            if raw_name.endswith(_CT_FP8_SCALE_SUFFIX):
+                                tensor = tensor.reshape(-1)
                     else:
                         tensor = f.get_tensor(raw_name)
 
                     # NVFP4 dense-MLP scales are consumed with their .weight (below), never yielded.
-                    if raw_name.endswith(_NVFP4_DENSE_SCALE_SUFFIXES):
+                    if config.dense_quant == "nvfp4" and raw_name.endswith(_NVFP4_DENSE_SCALE_SUFFIXES):
                         continue
 
                     is_vision = name.startswith(("vision_tower.", "embed_vision."))
@@ -253,7 +257,6 @@ def iter_weights(
                         )
                         continue
 
-                    tensor = f.get_tensor(raw_name)
                     if is_vision or is_expert:
                         yield name, tensor
                         continue

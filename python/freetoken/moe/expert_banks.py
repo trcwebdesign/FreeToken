@@ -188,10 +188,21 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     )
 
 
+def _compressed_tensors_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for Gemma compressed-tensors expert banks"
+        )
+    from freetoken.models.gemma4.weight import _load_ct_fp8_expert_banks
+
+    return _load_ct_fp8_expert_banks(model_path, model_config, layer_sink=layer_sink)
+
+
 # expert formats that still load through their own provider (GGUF)
 _PROVIDERS = {
     "q4_0": _q4_0_banks,
     "nvfp4": _nvfp4_banks,
+    "compressed-tensors": _compressed_tensors_banks,
 }
 
 
@@ -370,7 +381,11 @@ def load_expert_banks(
     from freetoken.moe.host_banks import requested_residency
 
     def _build(par: bool) -> ExpertBanks:
-        if method is not None:
+        # compressed-tensors experts (e.g. Gemma) have no quant pieces; they load entirely through
+        # the legacy provider path (_compressed_tensors_banks -> _load_ct_fp8_expert_banks),
+        # even if method is set to UnquantizedMoEMethod.
+        expert_quant = getattr(model_config, "expert_quant", "none")
+        if method is not None and expert_quant != "compressed-tensors":
             return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink)
         return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink)
 
