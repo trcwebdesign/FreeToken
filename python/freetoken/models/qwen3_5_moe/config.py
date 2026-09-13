@@ -16,7 +16,10 @@ def _expert_quant(hf_config: Any, text: Any) -> tuple[str, tuple[int, int] | Non
     if not (getattr(text, "num_experts", 0) or 0):
         return "none", None
     # the engine reads this tag for its MoE strategy decisions; every module takes its own scheme from the QuantConfig when it is built
-    scheme = QuantConfig.from_hf(hf_config).scheme_for_name("model.language_model.layers.0.mlp.experts.0.gate_proj")
+    quant = QuantConfig.from_hf(hf_config)
+    scheme = quant.scheme_for_name("model.layers.0.mlp.experts.0.gate_proj")
+    if scheme is None:
+        scheme = quant.scheme_for_name("model.language_model.layers.0.mlp.experts.0.gate_proj")
     if scheme is None:
         return "none", None
     return str(scheme.kind), scheme.weight.group if scheme.kind is QuantKind.FP8_BLOCK else None
