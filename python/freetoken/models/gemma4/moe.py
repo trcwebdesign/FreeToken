@@ -5,10 +5,30 @@ from typing import TYPE_CHECKING
 import torch
 from freetoken.kernel.triton.gemma4_fused import gemma_dual_rmsnorm_residual_scalar
 from freetoken.layers import BaseOP, GemmaRMSNorm, LinearReplicated, make_moe_layer
-from freetoken.models.blocks import GatedMLP
+from freetoken.models.blocks import GatedMLP, gelu_tanh_and_mul
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
+
+
+class _Nvfp4GatedMLP(BaseOP):
+    def __init__(self, config: ModelConfig):
+        from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged, Nvfp4DenseLinear
+
+        self.gate_up_proj = Nvfp4DenseColMerged(
+            config.hidden_size,
+            [config.intermediate_size, config.intermediate_size],
+            has_bias=False,
+        )
+        self.act_fn = gelu_tanh_and_mul
+        self.down_proj = Nvfp4DenseLinear(
+            config.intermediate_size,
+            config.hidden_size,
+            has_bias=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj.forward(self.act_fn(self.gate_up_proj.forward(x)))
 
 
 class Gemma4Router(BaseOP):
