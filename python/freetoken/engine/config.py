@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import json
+import os
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, List
@@ -112,10 +114,16 @@ class EngineConfig:
     @cached_property
     def active_encoders(self) -> tuple[EncoderSpec, ...]:
         """The encoder towers this process builds: the family registers them, the checkpoint config carries their section, --mm-disable did not name them."""
+        ftw_visual = None
+        if os.path.isfile(os.path.join(self.model_path, "freetoken_weight.json")):
+            with open(os.path.join(self.model_path, "freetoken_weight.json"), encoding="utf-8") as f:
+                names = {entry["name"] for entry in json.load(f).get("tensors", ())}
+            ftw_visual = any(name.startswith("visual.") for name in names)
         return tuple(
             e
             for e in self.model_spec.encoders
             if getattr(self.hf_config, e.config_key, None) is not None
+            and (ftw_visual is not False or e.kind != "vision")
             and e.kind not in self.mm.disabled_encoders
         )
 
