@@ -166,13 +166,6 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
     ),
-    "Qwen3_5MoeForCausalLM": ModelSpec(
-        "freetoken.models.qwen3_5_moe",
-        "Qwen3_5MoEForCausalLM",
-        checkpoint_roots=_LANGUAGE_MODEL_ROOT,
-        packed_modules_mapping=_QWEN3_5_PACKED,
-        unquantized_modules=_QWEN3_5_UNQUANTIZED,
-    ),
     # Qwen3.8-Flash-Next (model_type qwen4_exp): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.). 36 GDN + 12 QSA
     # compressed-sparse attention layers on 4 hyper-connection residual streams, a PLE

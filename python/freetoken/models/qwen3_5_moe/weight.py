@@ -127,7 +127,15 @@ class _DenseReader:
         """The scheme the checkpoint stores ``module`` under, before the family's unquantized_modules."""
         if self.quant is None:
             return None
-        return self.quant.scheme_for_name(self.quant.name_map.to_checkpoint(module)[0])
+        checkpoint_names = self.quant.name_map.to_checkpoint(module)
+        for name in checkpoint_names:
+            scheme = self.quant.scheme_for_name(name)
+            if scheme is not None:
+                return scheme
+        # Multimodal Qwen checkpoints can store tensors below model.language_model
+        # while ModelOpt metadata names the logical text module as model.layers.
+        logical_name = module.removeprefix("model.language_model.")
+        return self.quant.scheme_for_name(logical_name)
 
     def target(self, module: str) -> tuple[str, int, int]:
         """``(fused module, part index, part count)``; a standalone linear is its own single-part target."""
@@ -163,7 +171,10 @@ class _DenseReader:
         _, parts, expected = self.pending.setdefault(target, (count, {}, {}))
         parts.setdefault(idx, {})[role] = tensor
         expected[idx] = set(roles.values())
-        if len(parts) < count or any(set(parts[i]) != expected[i] for i in parts):
+        required = {
+            i: roles - {"input_scale"} for i, roles in expected.items()
+        }
+        if len(parts) < count or any(not required[i].issubset(parts[i]) for i in parts):
             return []
         del self.pending[target]
         return self._emit(target, [parts[i] for i in range(count)], stored)

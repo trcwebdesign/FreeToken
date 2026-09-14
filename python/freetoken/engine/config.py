@@ -129,9 +129,16 @@ class EngineConfig:
         # the parser sees no section for a tower this process does not build (for the vision tower that also means 1-D rope)
         hf_config = copy.copy(self.hf_config)
         built = {e.config_key for e in self.active_encoders}
-        for key in set(ENCODER_SECTIONS) | {e.config_key for e in self.model_spec.encoders}:
-            if key not in built:
-                setattr(hf_config, key, None)
+        disabled = {
+            key
+            for key in set(ENCODER_SECTIONS) | {e.config_key for e in self.model_spec.encoders}
+            if key not in built and hasattr(hf_config, key)
+        }
+        # ``dataclasses.replace`` rebuilds Transformer config objects and drops dynamic
+        # attributes such as ``quantization_config``. Mutate the shallow copy through the
+        # dataclass escape hatch instead, preserving the checkpoint's quant metadata.
+        for key in disabled:
+            object.__setattr__(hf_config, key, None)
         spec = self.model_spec
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)

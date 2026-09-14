@@ -20,6 +20,7 @@ class ModelOptConfig(QuantConfig):
         "NVFP4": nvfp4_scheme(input_scale=True),
         "NVFP4_NO_INPUT": nvfp4_scheme(input_scale=False),
         "FP8": fp8_tensor_scheme("fp32", input_scale=True),
+        "FP8_NO_INPUT": fp8_tensor_scheme("fp32", input_scale=False),
         "FP8_PER_CHANNEL_PER_TOKEN": fp8_tensor_scheme("fp32", per_row=True),
         "FP8_PB_WO": fp8_block_scheme("fp32"),
         "MXFP8": mxfp8_scheme(),
@@ -42,7 +43,10 @@ class ModelOptConfig(QuantConfig):
         self.ignore = name_set(tuple(q.get("ignore") or q.get("exclude_modules") or ()))
         layers = q.get("quantized_layers") or {}
         self.quantized_layers = {k: str((v or {}).get("quant_algo") or "").upper() for k, v in layers.items()} if isinstance(layers, dict) else {}
-        self.with_input_scale = bool(q.get("with_input_scale", True))
+        # ModelOpt weight-only exports omit activation scales unless explicitly enabled.
+        # Treat an absent flag as false; otherwise the model declares input_scale buffers
+        # that the checkpoint cannot provide.
+        self.with_input_scale = bool(q.get("with_input_scale", False))
         if self.algo == "MIXED_PRECISION" and not self.quantized_layers:
             raise NotImplementedError("ModelOpt MIXED_PRECISION without quantized_layers in quantization_config")
         if self.algo != "MIXED_PRECISION":
@@ -66,6 +70,8 @@ class ModelOptConfig(QuantConfig):
     def _scheme_of(self, algo: str) -> QuantScheme:
         if algo in ("NVFP4", "W4A16_NVFP4"):
             return self.SCHEMES["NVFP4" if self.with_input_scale else "NVFP4_NO_INPUT"]
+        if algo == "FP8" and not self.with_input_scale:
+            return self.SCHEMES["FP8_NO_INPUT"]
         try:
             return self.SCHEMES[algo]
         except KeyError:
