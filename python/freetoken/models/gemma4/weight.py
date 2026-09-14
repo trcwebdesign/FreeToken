@@ -149,6 +149,7 @@ def iter_weights(
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     def rename_key(raw_name: str) -> str | None:
         prefix = "model.language_model."
@@ -163,6 +164,8 @@ def iter_weights(
             )
         if raw_name.startswith("model.embed_vision."):
             return "embed_vision." + raw_name[len("model.embed_vision.") :]
+        if raw_name.startswith("model.vision_embedder."):
+            return "vision_embedder." + raw_name[len("model.vision_embedder.") :]
         return None
 
     def merge_info(key: str) -> tuple[str, MergeRule] | None:
@@ -230,7 +233,9 @@ def iter_weights(
                     if config.dense_quant == "nvfp4" and raw_name.endswith(_NVFP4_DENSE_SCALE_SUFFIXES):
                         continue
 
-                    is_vision = name.startswith(("vision_tower.", "embed_vision."))
+                    is_vision = name.startswith(("vision_tower.", "embed_vision.", "vision_embedder."))
+                    if is_vision and not include_vision:
+                        continue
                     is_expert = (
                         not is_vision and _PACKED_EXPERT_PATTERN.match(name) is not None
                     )
