@@ -21,6 +21,7 @@ def load_gguf_tokenizer(model_path: str):
     from transformers.integrations.ggml import convert_gguf_tokenizer
     from tokenizers import Tokenizer
     from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+    from tokenizers.decoders import Metaspace
     from tokenizers.models import BPE
     from tokenizers.pre_tokenizers import ByteLevel
     from tokenizers import AddedToken
@@ -62,9 +63,10 @@ def load_gguf_tokenizer(model_path: str):
         return tokens[int(tid)] if tid is not None and int(tid) < len(tokens) else default
 
     unknown_token = tok_for("unknown_token_id", tokens[0] if tokens else "<unk>")
-    hf_nvfp4 = meta.get("freetoken.gguf_format") == "hf_nvfp4" or (
-        arch.startswith("qwen") and tok_dict.get("model") == "gpt2"
-    )
+    # The hf_nvfp4 marker describes the weight layout, not the tokenizer family. Gemma4
+    # checkpoints can carry the same marker but use their own SentencePiece-compatible
+    # converter; only Qwen GPT2/BPE vocabularies belong in this custom ByteLevel path.
+    hf_nvfp4 = arch.startswith("qwen") and tok_dict.get("model") == "gpt2"
     if hf_nvfp4:
         # The embedded Qwen vocabulary is GPT-2 byte-level BPE. Treating it like a
         # SentencePiece vocabulary turns spaces into the fallback unknown token.
@@ -88,6 +90,12 @@ def load_gguf_tokenizer(model_path: str):
         fast.add_special_tokens([AddedToken(token, special=True) for token in qwen_added])
     else:
         fast, _extra = convert_gguf_tokenizer(conv_arch, tok_dict)
+        # Gemma's vocabulary uses SentencePiece's U+2581 word marker. Some versions of
+        # the GGUF converter build the tokenizer model but leave a byte/BPE-style decoder
+        # attached, exposing ``▁`` and replacement characters in generated text. Restore
+        # the SentencePiece-compatible decoder explicitly for non-GPT2 vocabularies.
+        if tok_dict.get("model") != "gpt2":
+            fast.decoder = Metaspace()
 
     # gemma4 chat turns end with <turn|>; prefer it as eos so chat generation halts
     # (the formal <eos> is also a stop id, see gguf_eos_token_ids).
@@ -99,6 +107,13 @@ def load_gguf_tokenizer(model_path: str):
         unk_token=unknown_token,
         pad_token=tok_for("padding_token_id", "<pad>"),
     )
+    if not hf_nvfp4 and tok_dict.get("model") != "gpt2":
+        # Reassign after the HF wrapper is built as well. The GGUF converter and some
+        # transformers versions replace the backend decoder during wrapping, which leaves
+        # SentencePiece's ``▁`` marker and malformed byte sequences visible in Gemma text.
+        tokenizer.backend_tokenizer.decoder = Metaspace(
+            replacement="▁", prepend_scheme="always"
+        )
     chat_template = meta.get("tokenizer.chat_template")
     if chat_template:
         tokenizer.chat_template = chat_template
