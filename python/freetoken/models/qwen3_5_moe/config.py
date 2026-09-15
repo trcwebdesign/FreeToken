@@ -280,7 +280,9 @@ def parse_config(hf_config: Any) -> ModelConfig:
             "nvfp4" if getattr(hf_config, "is_gguf", False) and getattr(hf_config, "has_nvfp4", False)
             else "q4_k" if getattr(hf_config, "is_gguf", False) else None
         ),
-        gguf_model_path=getattr(hf_config, "model_path", None),
+        gguf_model_path=getattr(
+            hf_config, "gguf_model_path", getattr(hf_config, "model_path", None)
+        ),
         gguf_block_count=getattr(hf_config, "gguf_block_count", None),
         gguf_tensor_types=getattr(hf_config, "gguf_tensor_types", None),
     )
