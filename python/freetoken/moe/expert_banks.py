@@ -172,12 +172,41 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
+def _q4_k_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    from freetoken.kernel.gguf import ggml_dequantize
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+    from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
+
+    E, H, I, L = model_config.num_experts, model_config.hidden_size, model_config.moe_intermediate_size, model_config.num_layers
+    hb = alloc_layer_banks({"gate_up": ((E, 2 * I, H), torch.bfloat16), "down": ((E, H, I), torch.bfloat16)}, L)
+    banks = {name: [bank.tensor for bank in layers] for name, layers in hb.items()}
+    tensors = {t.name: t for t in iter_gguf_tensors(model_path)}
+    for layer in range(L):
+        gate = tensors[f"blk.{layer}.ffn_gate_exps.weight"]
+        up = tensors[f"blk.{layer}.ffn_up_exps.weight"]
+        down = tensors[f"blk.{layer}.ffn_down_exps.weight"]
+
+        def dequant(tensor):
+            packed = tensor.packed().to(device="cuda", dtype=torch.uint8)
+            rows, cols = tensor.rows, int(tensor.shape[-1])
+            return ggml_dequantize(packed, tensor.ggml_type, rows, cols, torch.bfloat16).reshape(-1, cols).cpu()
+
+        banks["gate_up"][layer].copy_(torch.cat((dequant(gate).reshape(E, I, H), dequant(up).reshape(E, I, H)), dim=1))
+        banks["down"][layer].copy_(dequant(down).reshape(E, H, I))
+    if layer_sink is None and torch.cuda.is_available():
+        pin_banks(hb)
+    return ExpertBanks("bf16", banks, streamed=layer_sink is not None and not dummy)
+
+
 def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
     if parallel:
         raise NotImplementedError(
             "parallel reader not implemented for nvfp4 GGUF: use the GGUF-native reader"
         )
-    from freetoken.models.gemma4.gguf import load_nvfp4_expert_sources
+    if model_path.endswith(".gguf") and getattr(model_config, "model_type", "") == "qwen3_5_moe":
+        from freetoken.models.qwen3_5_moe.weight import load_nvfp4_expert_sources
+    else:
+        from freetoken.models.gemma4.gguf import load_nvfp4_expert_sources
 
     sources = load_nvfp4_expert_sources(
         model_path, model_config, layer_sink=None if dummy else layer_sink
@@ -201,6 +230,7 @@ def _compressed_tensors_banks(model_path, model_config, device, dtype, dummy, pa
 # expert formats that still load through their own provider (GGUF)
 _PROVIDERS = {
     "q4_0": _q4_0_banks,
+    "q4_k": _q4_k_banks,
     "nvfp4": _nvfp4_banks,
     "compressed-tensors": _compressed_tensors_banks,
 }

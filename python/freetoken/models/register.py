@@ -94,11 +94,13 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.qwen3",
         "Qwen3ForCausalLM",
         packed_modules_mapping=_DENSE_PACKED,
+        parse_config="parse_gguf_config",
     ),
     "Qwen3MoeForCausalLM": ModelSpec(
         "freetoken.models.qwen3_moe",
         "Qwen3MoeForCausalLM",
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
+        parse_config="parse_gguf_config",
     ),
     # Qwen3-VL: the Qwen3 text tower under model.language_model. plus the shared Qwen VL vision tower with DeepStack; the MoE variant ships its experts pre-stacked.
     "Qwen3VLForConditionalGeneration": ModelSpec(
@@ -162,12 +164,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen3_5MoeForCausalLM",
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        parse_config="parse_gguf_config",
     ),
     "Qwen3_5ForCausalLM": ModelSpec(
         "freetoken.models.qwen3_5_moe",
         "Qwen3_5ForCausalLM",
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        parse_config="parse_gguf_config",
     ),
     # Qwen3.8-Flash-Next (model_type qwen4_exp): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.). 36 GDN + 12 QSA

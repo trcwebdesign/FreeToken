@@ -9,6 +9,7 @@ from freetoken.layers import (
     GemmaRMSNorm,
     OPList,
     ParallelLMHead,
+    LinearReplicated,
     VocabParallelEmbedding,
 )
 from freetoken.models.blocks import BaseLLMModel
@@ -109,6 +110,10 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
             prefix="lm_head",
         )
         super().__init__()
+        if getattr(config, "moe_weight_format", None) == "nvfp4":
+            _convert_qwen3_5_to_nvfp4(self, config)
+        elif getattr(config, "moe_weight_format", None) == "q4_k":
+            _convert_qwen3_5_to_gguf(self, config)
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
@@ -137,3 +142,79 @@ __all__ = [
     "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
 ]
+
+
+def _convert_qwen3_5_to_nvfp4(model, config) -> None:
+    from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged, Nvfp4DenseLinear, Nvfp4LMHead
+    from freetoken.models.gemma4.gguf import Nvfp4Embedding
+
+    model.model.embed_tokens = Nvfp4Embedding(config.vocab_size, config.hidden_size)
+    model.lm_head = Nvfp4LMHead(config.vocab_size, config.hidden_size)
+    for layer in model.model.layers.op_list:
+        if layer._is_linear:
+            attn = layer.linear_attn
+            attn.in_proj = Nvfp4DenseColMerged(attn.in_proj.in_features, attn._in_proj_split)
+            attn.out_proj = Nvfp4DenseLinear(attn.value_dim, config.hidden_size)
+        else:
+            attn = layer.self_attn
+            attn.qkv_proj = Nvfp4DenseColMerged(
+                attn.qkv_proj.in_features,
+                attn._qkv_split,
+                has_bias=False,
+            )
+            attn.o_proj = Nvfp4DenseLinear(attn.qo_attn_dim, config.hidden_size, has_bias=False)
+        if config.moe_enabled:
+            shared = layer.mlp.shared_expert
+        else:
+            shared = layer.mlp
+        shared.gate_up_proj = Nvfp4DenseColMerged(config.hidden_size, [config.shared_expert_intermediate_size] * 2 if config.moe_enabled else [config.intermediate_size] * 2)
+        shared.down_proj = Nvfp4DenseLinear(config.shared_expert_intermediate_size if config.moe_enabled else config.intermediate_size, config.hidden_size)
+
+def _convert_qwen3_5_to_gguf(model, config) -> None:
+    from freetoken.layers.gguf import GGUFEmbedding, GGUFMergedLinear, GGUFLinear
+    from freetoken.models.gguf.dequant import GGML_Q4_K, GGML_Q6_K
+
+    model.model.embed_tokens = GGUFEmbedding(config.vocab_size, config.hidden_size, GGML_Q4_K)
+    model.lm_head = GGUFLinear(config.hidden_size, config.vocab_size, GGML_Q6_K)
+    tensor_types = config.gguf_tensor_types or {}
+    for layer in model.model.layers.op_list:
+        if layer._is_linear:
+            attn = layer.linear_attn
+            prefix = f"blk.{layer._layer_id}."
+            qkv_type = tensor_types.get(prefix + "attn_qkv.weight", GGML_Q6_K)
+            gate_type = tensor_types.get(prefix + "attn_gate.weight", GGML_Q4_K)
+            alpha_type = tensor_types.get(prefix + "ssm_alpha.weight", GGML_Q4_K)
+            beta_type = tensor_types.get(prefix + "ssm_beta.weight", GGML_Q4_K)
+            out_type = tensor_types.get(prefix + "ssm_out.weight", GGML_Q4_K)
+            attn.in_proj = GGUFMergedLinear(config.hidden_size, [8192, 4096, 32, 32], [qkv_type, gate_type, alpha_type, beta_type])
+            attn._split_in_proj = False
+            # llama.cpp tiles the GDN V-head columns in ssm_out; the loader untile step
+            # materializes this projection densely because the permutation crosses blocks.
+            attn.out_proj = LinearReplicated(attn.value_dim, config.hidden_size, has_bias=False)
+        else:
+            attn = layer.self_attn
+            prefix = f"blk.{layer._layer_id}."
+            q_type = tensor_types.get(prefix + "attn_q.weight", GGML_Q4_K)
+            k_type = tensor_types.get(prefix + "attn_k.weight", GGML_Q4_K)
+            v_type = tensor_types.get(prefix + "attn_v.weight", GGML_Q6_K)
+            out_type = tensor_types.get(prefix + "attn_output.weight", GGML_Q4_K)
+            attn.qkv_proj = GGUFMergedLinear(
+                config.hidden_size,
+                [attn._qkv_split[0], attn._qkv_split[1], attn._qkv_split[2]],
+                [q_type, k_type, v_type],
+            )
+            attn.o_proj = GGUFLinear(attn.qo_attn_dim, config.hidden_size, out_type)
+        shared = layer.mlp.shared_expert
+        prefix = f"blk.{layer._layer_id}."
+        gate_type = tensor_types.get(prefix + "ffn_gate_shexp.weight", GGML_Q4_K)
+        up_type = tensor_types.get(prefix + "ffn_up_shexp.weight", gate_type)
+        down_type = tensor_types.get(prefix + "ffn_down_shexp.weight", GGML_Q6_K)
+        if gate_type == up_type:
+            shared.gate_up_proj = GGUFLinear(config.hidden_size, 2 * config.shared_expert_intermediate_size, gate_type)
+        else:
+            shared.gate_up_proj = GGUFMergedLinear(
+                config.hidden_size,
+                [config.shared_expert_intermediate_size] * 2,
+                [gate_type, up_type],
+            )
+        shared.down_proj = GGUFLinear(config.shared_expert_intermediate_size, config.hidden_size, down_type)

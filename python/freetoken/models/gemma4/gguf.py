@@ -339,23 +339,9 @@ def iter_gguf_weights(
     assert not gate_up_buf, f"incomplete gate_up groups: {sorted(gate_up_buf)}"
 
 
-def _nvfp4_parts(t) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split GGML NVFP4 blocks into FreeToken's packed and E4M3-scale buffers.
+from freetoken.models.gguf.nvfp4 import nvfp4_parts
 
-    GGML stores each 16-value scale group as eight low nibbles followed by eight
-    high nibbles. FreeToken's kernels consume adjacent nibble pairs, so repack the
-    four groups in each 64-value block while preserving the GGML scale bytes.
-    """
-    raw = t.packed()
-    blocks = raw.reshape(t.rows, -1, 36)
-    scales = blocks[:, :, :4].reshape(t.rows, -1).contiguous()
-    grouped = blocks[:, :, 4:].reshape(t.rows, -1, 4, 8)
-    even = grouped[..., 0::2]
-    odd = grouped[..., 1::2]
-    low_pairs = (even & 0x0F) | ((odd & 0x0F) << 4)
-    high_pairs = (even >> 4) | ((odd >> 4) << 4)
-    packed = torch.cat((low_pairs, high_pairs), dim=-1).reshape(t.rows, -1).contiguous()
-    return packed, scales.view(torch.float8_e4m3fn)
+_nvfp4_parts = nvfp4_parts
 
 
 def _iter_hf_nvfp4_weights(model_path, device, include_moe_experts, include_non_moe):
@@ -673,17 +659,18 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
 # Routed-expert host banks (native Q4_0) for the offload cache.
 # --------------------------------------------------------------------------------------
 
-def _q4_0_expert_specs(config: ModelConfig) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+def _q4_0_expert_specs(config: ModelConfig, gate_up_type=GGML_Q4_0, down_type=GGML_Q4_0) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     E = config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
     return {
-        "gate_up": ((E, 2 * I, row_bytes(H, GGML_Q4_0)), torch.uint8),
-        "down": ((E, H, row_bytes(I, GGML_Q4_0)), torch.uint8),
+        "gate_up": ((E, 2 * I, row_bytes(H, gate_up_type)), torch.uint8),
+        "down": ((E, H, row_bytes(I, down_type)), torch.uint8),
     }
 
 
 def load_q4_0_expert_sources(
-    model_path: str, config: ModelConfig, *, layer_sink=None
+    model_path: str, config: ModelConfig, *, layer_sink=None, quant_type=GGML_Q4_0,
+    down_quant_type=None
 ) -> dict[str, list[torch.Tensor]]:
     """Per-layer host banks of the routed experts' native Q4_0 block bytes.
 
@@ -701,27 +688,39 @@ def load_q4_0_expert_sources(
     valid until then (the caller owns that tradeoff).
     """
     from freetoken.models.gguf.reader import iter_gguf_tensors
-    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
+    from freetoken.moe.host_banks import HostBank, LayerCompletionTracker, PinPipeline
 
     _require_tp1("expert banks")
     L, E = config.num_layers, config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
-    h_bytes, i_bytes = row_bytes(H, GGML_Q4_0), row_bytes(I, GGML_Q4_0)
-    hb = alloc_layer_banks(_q4_0_expert_specs(config), L)  # lazy anon mmaps (unpinned)
+    down_quant_type = quant_type if down_quant_type is None else down_quant_type
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    tensors = {t.name: t for t in iter_gguf_tensors(model_path)}
+    hb = {
+        "gate_up": [HostBank((E, 2 * I, tensors[f"blk.{layer}.ffn_gate_exps.weight"].row_bytes), torch.uint8) for layer in range(L)],
+        "down": [HostBank((E, H, tensors[f"blk.{layer}.ffn_down_exps.weight"].row_bytes), torch.uint8) for layer in range(L)],
+    }
     banks = {name: [b.tensor for b in hb[name]] for name in hb}
     seen_gu, seen_dn = set(), set()
+    pending_gu: dict[int, dict[str, torch.Tensor]] = {}
 
     def _load(sink) -> None:
         tracker = LayerCompletionTracker(2, hb, sink) if sink is not None else None  # gate_up + down
-        for t in iter_gguf_tensors(model_path):
+        for t in tensors.values():
             if not t.name.startswith("blk."):
                 continue
             layer = int(t.name.split(".")[1])
-            if t.name.endswith("ffn_gate_up_exps.weight"):
-                banks["gate_up"][layer].copy_(t.packed().reshape(E, 2 * I, h_bytes))
-                seen_gu.add(layer)
+            if t.name.endswith("ffn_gate_exps.weight") or t.name.endswith("ffn_up_exps.weight"):
+                slot = "gate" if t.name.endswith("ffn_gate_exps.weight") else "up"
+                parts = pending_gu.setdefault(layer, {})
+                parts[slot] = t.packed().reshape(E, I, t.row_bytes)
+                if len(parts) == 2:
+                    banks["gate_up"][layer].copy_(torch.cat([parts["gate"], parts["up"]], dim=1))
+                    seen_gu.add(layer)
+                    del pending_gu[layer]
             elif t.name.endswith("ffn_down_exps.weight"):
-                banks["down"][layer].copy_(t.packed().reshape(E, H, i_bytes))
+                banks["down"][layer].copy_(t.packed().reshape(E, H, t.row_bytes))
                 seen_dn.add(layer)
             else:
                 continue

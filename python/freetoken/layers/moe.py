@@ -432,6 +432,15 @@ class OffloadMoELayer(MoELayer):
             return fused_experts_gguf_q4_0(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
+        if fmt == "q4_k":
+            # Native GGUF Q4_K experts share the same packed bank layout as Q4_0 and
+            # are decoded by the same grouped GEMV kernel; only the quant type changes.
+            from freetoken.moe.fused_q4_0 import fused_experts_gguf_q4_k
+
+            gate_up, down = views
+            return fused_experts_gguf_q4_k(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
+            )
         if fmt == "nvfp4":
             from freetoken.moe.fused_nvfp4 import (
                 fused_experts_decode_nvfp4_marlin,
@@ -455,6 +464,19 @@ class OffloadMoELayer(MoELayer):
                 topk_ids,
                 self.activation,
                 self.apply_router_weight_on_input,
+            )
+        if fmt == "bf16":
+            from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl
+
+            gate_up, down = views
+            if is_prefill:
+                return fused_experts_impl(
+                    hidden_states, gate_up, down, topk_weights, topk_ids,
+                    self.activation, self.apply_router_weight_on_input, self.num_experts,
+                )
+            return fused_experts_decode_impl(
+                hidden_states, gate_up, down, topk_weights, topk_ids,
+                self.activation, self.apply_router_weight_on_input,
             )
         raise AssertionError(f"offload experts without a quant method only serve q4_0/nvfp4 banks, got {fmt!r}")
 

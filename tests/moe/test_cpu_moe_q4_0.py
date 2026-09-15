@@ -21,6 +21,49 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
+def test_q4_k_gguf_moe_dispatches_to_native_kernel(monkeypatch):
+    from freetoken.layers.moe import OffloadMoELayer
+
+    layer = object.__new__(OffloadMoELayer)
+    layer.quant_method = None
+    layer.activation = "silu"
+    layer.apply_router_weight_on_input = False
+    layer.num_experts = 4
+
+    gate_up = torch.empty((8, 2, 4), dtype=torch.uint8)
+    down = torch.empty((8, 4, 2), dtype=torch.uint8)
+    hidden = torch.randn(2, 4, dtype=torch.bfloat16)
+    topk_w = torch.tensor([[0.5, 0.5], [1.0, 0.0]], dtype=torch.float32)
+    topk_ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.int32)
+
+    calls = {}
+
+    def fake(path):
+        calls["called"] = True
+        return torch.zeros((2, 4), dtype=torch.bfloat16)
+
+    monkeypatch.setattr("freetoken.moe.fused_q4_0.fused_experts_gguf_q4_k", fake)
+
+    cache = SimpleNamespace(
+        quant_format="q4_k",
+        bank_views=lambda *args, **kwargs: (gate_up, down),
+    )
+
+    out = layer._expert_gemm(
+        cache,
+        hidden,
+        topk_w,
+        topk_ids,
+        views=(gate_up, down),
+        n=None,
+        alphas=None,
+        is_prefill=False,
+    )
+
+    assert calls["called"]
+    assert out.dtype == torch.bfloat16
+
+
 def _pack_q4_0(nibbles: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Pack [S, OUT, K] uint8 nibble codes (0..15) + [S, OUT, K//32] fp16 scales into
     the native Q4_0 row layout [S, OUT, K//32*18]: each 32-elem block is a 2-byte fp16

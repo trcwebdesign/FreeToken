@@ -18,6 +18,11 @@ from .reader import GGML_NVFP4, GGUF_FORMAT_KV, gguf_architecture, load_gguf_met
 # reuses the model classes but a GGUF parse_config / iter_weights).
 GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "gemma4": "Gemma4GGUFForCausalLM",
+    "qwen3": "Qwen3MoeForCausalLM",
+    "qwen3_moe": "Qwen3MoeForCausalLM",
+    "qwen3_5_moe": "Qwen3_5MoeForCausalLM",
+    "qwen3_5": "Qwen3_5MoeForCausalLM",
+    "qwen35moe": "Qwen3_5MoeForCausalLM",
 }
 
 
@@ -74,13 +79,15 @@ def _vocab_size(model_path: str) -> int:
 
 def build_gguf_shim(model_path: str) -> GgufConfigShim:
     arch = gguf_architecture(model_path)
+    names = gguf_tensor_names(model_path)
+    if arch == "qwen3" and any(".linear_attn." in name for name in names):
+        arch = "qwen3_5_moe"
     registry_key = GGUF_ARCH_TO_REGISTRY.get(arch)
     if registry_key is None:
         raise ValueError(
             f"GGUF architecture {arch!r} is not supported "
             f"(known: {sorted(GGUF_ARCH_TO_REGISTRY)})"
         )
-    names = gguf_tensor_names(model_path)
     metadata = load_gguf_metadata(model_path)
     if names:
         # No separate output projection -> embeddings are tied.

@@ -328,6 +328,11 @@ class ModelConfig:
     has_attn_bias: bool = False
     has_router_bias: bool = False
     moe_weight_format: str | None = None
+    gguf_model_path: str | None = None
+    # Raw GGUF block_count, which may include trailing NextN/MTP blocks excluded from the
+    # decoder stack used for ordinary text generation.
+    gguf_block_count: int | None = None
+    gguf_tensor_types: dict[str, int] | None = None
     gguf_embedding_bf16: bool = False
     gguf_router_bf16: bool = False
     gguf_dense_bf16: bool = False
