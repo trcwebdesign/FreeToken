@@ -272,7 +272,14 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attention_groups=groups,
         expert_quant=("nvfp4" if getattr(hf_config, "has_nvfp4", False) else "q4_k") if getattr(hf_config, "is_gguf", False) and num_experts else expert_quant,
         weight_block_size=weight_block_size,
-        moe_weight_format="nvfp4" if getattr(hf_config, "has_nvfp4", False) else "q4_k",
+        # Native GGUF conversion is only valid for a GGUF config. HF/FTW NVFP4
+        # checkpoints keep their regular quantization modules and FTW tensor names;
+        # marking them q4_k makes the model allocate GGUF qweight buffers and causes
+        # missing-key failures such as model.embed_tokens.qweight.
+        moe_weight_format=(
+            "nvfp4" if getattr(hf_config, "is_gguf", False) and getattr(hf_config, "has_nvfp4", False)
+            else "q4_k" if getattr(hf_config, "is_gguf", False) else None
+        ),
         gguf_model_path=getattr(hf_config, "model_path", None),
         gguf_block_count=getattr(hf_config, "gguf_block_count", None),
         gguf_tensor_types=getattr(hf_config, "gguf_tensor_types", None),

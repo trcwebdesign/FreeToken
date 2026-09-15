@@ -110,9 +110,9 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
             prefix="lm_head",
         )
         super().__init__()
-        if getattr(config, "moe_weight_format", None) == "nvfp4":
+        if getattr(config, "gguf_model_path", None) is not None and getattr(config, "moe_weight_format", None) == "nvfp4":
             _convert_qwen3_5_to_nvfp4(self, config)
-        elif getattr(config, "moe_weight_format", None) == "q4_k":
+        elif getattr(config, "gguf_model_path", None) is not None and getattr(config, "moe_weight_format", None) == "q4_k":
             _convert_qwen3_5_to_gguf(self, config)
 
     def forward(self) -> torch.Tensor:
