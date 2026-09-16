@@ -71,10 +71,12 @@ def parse_gguf_config(hf_config: Any) -> ModelConfig:
     block_count = gguf_block_count - nextn_layers
     layer_types = ["full_attention" if (i + 1) % 4 == 0 else "linear_attention" for i in range(block_count)]
     model_path = getattr(hf_config, "model_path", None)
+    tensor_names = None
     if model_path is not None:
         from freetoken.models.gguf.reader import gguf_tensor_names
 
         names = gguf_tensor_names(model_path)
+        tensor_names = names
         layer_types = [
             "linear_attention"
             if (
@@ -132,7 +134,8 @@ def parse_gguf_config(hf_config: Any) -> ModelConfig:
             "linear_key_head_dim": 128,
             "linear_value_head_dim": 128,
             "linear_conv_kernel_dim": 4,
-            "tie_word_embeddings": bool(getattr(hf_config, "tie_word_embeddings", False)),
+            "tie_word_embeddings": bool(getattr(hf_config, "tie_word_embeddings", False))
+            and not (tensor_names is not None and "lm_head.weight" in tensor_names),
         },
     )
     top = type(
@@ -144,7 +147,7 @@ def parse_gguf_config(hf_config: Any) -> ModelConfig:
             "architectures": ["Qwen3_5MoeForCausalLM"],
             "image_token_id": None,
             "video_token_id": None,
-            "tie_word_embeddings": bool(getattr(hf_config, "tie_word_embeddings", False)),
+            "tie_word_embeddings": data.tie_word_embeddings,
             "num_experts": data.num_experts,
             "num_experts_per_tok": data.num_experts_per_tok,
             "moe_intermediate_size": data.moe_intermediate_size,
