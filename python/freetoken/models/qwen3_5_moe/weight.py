@@ -293,10 +293,7 @@ def iter_gguf_weights(
             elif name.endswith(".linear_attn.norm.weight"):
                 yield name, _gguf_bf16(tensor).to(device)
             else:
-                value = _gguf_bf16(tensor).to(device)
-                if name == "model.norm.weight":
-                    value = value + 1.0
-                yield name, value
+                yield name, _gguf_bf16(tensor).to(device)
             continue
 
         # Routers stay as dense BF16 modules in Qwen3.5 even when the GGUF stores
