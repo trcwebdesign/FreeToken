@@ -93,6 +93,7 @@ def iter_gguf_weights(
 
     fusions: dict[str, dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = {}
     legacy_gate_up: dict[int, dict[str, torch.Tensor]] = {}
+    bf16_fusions: dict[str, dict[str, torch.Tensor]] = {}
     num_k_heads = 16
     num_v_heads = 32
     v_per_k = num_v_heads // num_k_heads
@@ -121,16 +122,22 @@ def iter_gguf_weights(
             yield "model.norm.weight", _gguf_bf16(tensor).to(device)
             continue
         if raw == "model.language_model.embed_tokens.weight":
-            packed, scales = _gguf_nvfp4_parts(tensor)
-            yield "model.embed_tokens.weight", packed.to(device)
-            yield "model.embed_tokens.weight_scale", scales.to(device)
-            yield "model.embed_tokens.weight_global", torch.ones(tensor.shape[0], dtype=torch.float16, device=device)
+            if tensor.ggml_type == GGML_NVFP4:
+                packed, scales = _gguf_nvfp4_parts(tensor)
+                yield "model.embed_tokens.weight", packed.to(device)
+                yield "model.embed_tokens.weight_scale", scales.to(device)
+                yield "model.embed_tokens.weight_global", torch.ones(tensor.shape[0], dtype=torch.float16, device=device)
+            else:
+                yield "model.embed_tokens.weight", _gguf_bf16(tensor).to(device)
             continue
         if raw == "lm_head.weight":
-            packed, scales = _gguf_nvfp4_parts(tensor, dense=True)
-            yield "lm_head.weight", packed.to(device)
-            yield "lm_head.weight_scale", scales.to(device)
-            yield "lm_head.weight_global", torch.ones(tensor.shape[0], dtype=torch.float16, device=device)
+            if tensor.ggml_type == GGML_NVFP4:
+                packed, scales = _gguf_nvfp4_parts(tensor, dense=True)
+                yield "lm_head.weight", packed.to(device)
+                yield "lm_head.weight_scale", scales.to(device)
+                yield "lm_head.weight_global", torch.ones(tensor.shape[0], dtype=torch.float16, device=device)
+            else:
+                yield "lm_head.weight", _gguf_bf16(tensor).to(device)
             continue
         if raw == "model.language_model.norm.weight":
             yield "model.norm.weight", _gguf_bf16(tensor).to(device) + 1.0
@@ -236,15 +243,60 @@ def iter_gguf_weights(
         if ".mlp.experts." in name:
             continue
         if tensor.ggml_type != GGML_NVFP4:
+            packed = tensor.packed().to(device)
+            if name.endswith(".linear_attn.A_log"):
+                value = _gguf_gdn_state(tensor).to(device)
+                yield name, value
+                continue
+            if name.endswith(".linear_attn.conv1d.weight"):
+                value = _gguf_gdn_state(tensor).to(device)
+                yield name, value.reshape(value.shape[0], 1, -1)
+                continue
+            if name.endswith(".linear_attn.out_proj.weight"):
+                value = _gguf_bf16(tensor).to(device)
+                yield name, value
+                continue
+            fusion_target = None
+            fusion_slot = None
+            for suffix, target_suffix, slot in (
+                (".linear_attn.in_proj_qkv.weight", ".linear_attn.in_proj", "qkv"),
+                (".linear_attn.in_proj_z.weight", ".linear_attn.in_proj", "z"),
+                (".linear_attn.in_proj_b.weight", ".linear_attn.in_proj", "b"),
+                (".linear_attn.in_proj_a.weight", ".linear_attn.in_proj", "a"),
+                (".self_attn.q_proj.weight", ".self_attn.qkv_proj", "q"),
+                (".self_attn.k_proj.weight", ".self_attn.qkv_proj", "k"),
+                (".self_attn.v_proj.weight", ".self_attn.qkv_proj", "v"),
+                (".mlp.shared_expert.gate_proj.weight", ".mlp.shared_expert.gate_up_proj", "gate"),
+                (".mlp.shared_expert.up_proj.weight", ".mlp.shared_expert.gate_up_proj", "up"),
+            ):
+                if name.endswith(suffix):
+                    fusion_target = name.removesuffix(suffix) + target_suffix
+                    fusion_slot = slot
+                    break
+            if fusion_target is not None:
+                bf16_fusions.setdefault(fusion_target, {})[fusion_slot] = packed
+                continue
+            if name.endswith((
+                ".self_attn.o_proj.weight",
+                ".mlp.shared_expert.down_proj.weight",
+            )):
+                yield name.removesuffix(".weight") + ".qweight", packed
+                continue
+            if name.endswith(".linear_attn.out_proj.weight"):
+                yield name, _gguf_bf16(tensor).to(device)
+                continue
             if name.endswith((".linear_attn.conv1d.weight", ".linear_attn.A_log", ".linear_attn.dt_bias", ".linear_attn.norm.weight")):
                 yield name, _gguf_gdn_state(tensor).to(device)
                 continue
             if name.endswith((".input_layernorm.weight", ".post_attention_layernorm.weight", ".self_attn.q_norm.weight", ".self_attn.k_norm.weight")):
-                yield name, _gguf_bf16(tensor).to(device)
+                yield name, _gguf_bf16(tensor).to(device) + 1.0
             elif name.endswith(".linear_attn.norm.weight"):
                 yield name, _gguf_bf16(tensor).to(device)
             else:
-                yield name, _gguf_bf16(tensor).to(device)
+                value = _gguf_bf16(tensor).to(device)
+                if name == "model.norm.weight":
+                    value = value + 1.0
+                yield name, value
             continue
 
         # Routers stay as dense BF16 modules in Qwen3.5 even when the GGUF stores
@@ -283,6 +335,18 @@ def iter_gguf_weights(
         if all(part in parts for part in order):
             yield from emit_fused(target, parts, order)
             del fusions[target]
+    for target, parts in bf16_fusions.items():
+        order = (
+            ("qkv", "z", "b", "a")
+            if target.endswith(".linear_attn.in_proj")
+            else ("q", "k", "v")
+            if target.endswith(".qkv_proj")
+            else ("gate", "up")
+        )
+        missing = [part for part in order if part not in parts]
+        if missing:
+            raise ValueError(f"incomplete BF16 Qwen GGUF fusion {target}: missing {missing}")
+        yield target + ".qweight", torch.cat([parts[part] for part in order], dim=0)
     missing = {target: sorted(parts) for target, parts in fusions.items()}
     if missing:
         raise ValueError(f"incomplete Qwen3.5 GGUF fused tensors: {missing}")

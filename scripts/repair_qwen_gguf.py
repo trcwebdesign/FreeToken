@@ -83,6 +83,8 @@ def tensor_info_end(handle: BinaryIO, tensor_count: int) -> int:
 def qwen_architecture(config: dict[str, object]) -> str:
     model_type = str(config.get("model_type", "")).lower()
     architectures = str(config.get("architectures", [""])).lower()
+    if "qwen3_5" in model_type or "qwen3_5" in architectures:
+        return "qwen35moe"
     if "qwen3" in model_type or "qwen3" in architectures:
         return "qwen3"
     if "qwen2" in model_type or "qwen2" in architectures:
@@ -128,22 +130,14 @@ def source_metadata(config_path: Path, tokenizer_path: Path, chat_template_path:
     tokens, special_ids, merges = read_tokenizer_vocab(tokenizer_path)
     chat_template = chat_template_path.read_text(encoding="utf-8")
 
+    architecture = qwen_architecture(config)
+    nextn_layers = int(text.get("num_nextn_predict_layers", text.get("nextn_predict_layers", 1)))
+    block_count = num_layers + nextn_layers if architecture == "qwen35moe" else num_layers
     metadata = {
-        "general.architecture": qwen_architecture(config),
+        "general.architecture": architecture,
         "general.alignment": ALIGNMENT,
         "general.name": config.get("_name_or_path", config.get("model_name", "Qwen")),
         "general.file_type": 1,
-        "qwen.block_count": num_layers,
-        "qwen.embedding_length": hidden_size,
-        "qwen.context_length": max_context,
-        "qwen.feed_forward_length": intermediate,
-        "qwen.attention.head_count": num_heads,
-        "qwen.attention.head_count_kv": num_kv_heads,
-        "qwen.attention.layer_norm_rms_epsilon": rms_eps,
-        "qwen.attention.key_length": head_dim,
-        "qwen.attention.value_length": head_dim,
-        "qwen.rope.dimension_count": head_dim,
-        "qwen.rope.freq_base": rope_theta,
         "tokenizer.ggml.model": "gpt2",
         "tokenizer.ggml.tokens": tokens,
         "tokenizer.ggml.scores": [0.0] * len(tokens),
@@ -159,12 +153,40 @@ def source_metadata(config_path: Path, tokenizer_path: Path, chat_template_path:
         "tokenizer.ggml.vocab_size": vocab_size,
     }
 
+    prefix = "qwen35moe" if architecture == "qwen35moe" else "qwen"
+    metadata.update({
+        f"{prefix}.block_count": block_count,
+        f"{prefix}.embedding_length": hidden_size,
+        f"{prefix}.context_length": max_context,
+        f"{prefix}.feed_forward_length": intermediate,
+        f"{prefix}.attention.head_count": num_heads,
+        f"{prefix}.attention.head_count_kv": num_kv_heads,
+        f"{prefix}.attention.layer_norm_rms_epsilon": rms_eps,
+        f"{prefix}.attention.key_length": head_dim,
+        f"{prefix}.attention.value_length": head_dim,
+        f"{prefix}.rope.dimension_count": int(text.get("partial_rotary_factor", 0.25) * head_dim),
+        f"{prefix}.rope.freq_base": rope_theta,
+    })
+
     if "num_experts" in text:
-        metadata["qwen.expert_count"] = int(text["num_experts"])
+        metadata[f"{prefix}.expert_count"] = int(text["num_experts"])
     if "num_experts_per_tok" in text:
-        metadata["qwen.expert_used_count"] = int(text["num_experts_per_tok"])
+        metadata[f"{prefix}.expert_used_count"] = int(text["num_experts_per_tok"])
     if "moe_intermediate_size" in text:
-        metadata["qwen.expert_feed_forward_length"] = int(text["moe_intermediate_size"])
+        metadata[f"{prefix}.expert_feed_forward_length"] = int(text["moe_intermediate_size"])
+    if architecture == "qwen35moe":
+        metadata.update({
+            "qwen35moe.expert_shared_feed_forward_length": int(
+                text.get("shared_expert_intermediate_size", text.get("shared_expert_feed_forward_length", 512))
+            ),
+            "qwen35moe.nextn_predict_layers": nextn_layers,
+            "qwen35moe.ssm.conv_kernel": 4,
+            "qwen35moe.ssm.state_size": 128,
+            "qwen35moe.ssm.group_count": 16,
+            "qwen35moe.ssm.time_step_rank": 32,
+            "qwen35moe.ssm.inner_size": 4096,
+            "qwen35moe.full_attention_interval": 4,
+        })
 
     generation_path = config_path.with_name("generation_config.json")
     if generation_path.exists():

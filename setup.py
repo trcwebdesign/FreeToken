@@ -62,7 +62,7 @@ setup(
             include_dirs=cuda_include_dirs,
             library_dirs=cuda_library_dirs,
             libraries=["cudart"],
-            extra_compile_args=["-O3", "-std=c++17", "-pthread"],
+            extra_compile_args=["-O3", "-std=c++17", "-pthread", "/DNOMINMAX"],
         ),
         # --ple-backend disk row store; Linux-only until the TableFile/BatchReader seams grow Windows bodies
         *([

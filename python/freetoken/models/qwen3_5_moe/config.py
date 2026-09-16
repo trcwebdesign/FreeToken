@@ -159,7 +159,6 @@ def parse_gguf_config(hf_config: Any) -> ModelConfig:
     top.gguf_tensor_types = {
         tensor.name: tensor.ggml_type
         for tensor in iter_gguf_tensors(hf_config.model_path)
-        if tensor.name.startswith("blk.")
     }
     return parse_config(top)
 
