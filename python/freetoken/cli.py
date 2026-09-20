@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from collections.abc import Sequence
 from typing import TextIO
 
@@ -110,6 +111,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         # open(), which uses the ANSI codepage (GBK on zh-Windows). Too late for THIS
         # process by design -- UTF-8 mode is fixed at interpreter startup.
         os.environ.setdefault("PYTHONUTF8", "1")
+        # TVM-FFI's default ``~/.cache/tvm-ffi`` path is split incorrectly by the
+        # Windows Ninja command when the user profile contains spaces.
+        os.environ.setdefault("TVM_FFI_CACHE_DIR", os.path.join(tempfile.gettempdir(), "tvm-ffi"))
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
         _print_help(sys.stderr)
