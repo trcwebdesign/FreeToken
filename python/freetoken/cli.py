@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from collections.abc import Sequence
 from typing import TextIO
@@ -102,6 +103,13 @@ COMMANDS = {
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    if os.name == "nt":
+        # Make every descendant interpreter (engine, scheduler, detokenizer, spawned
+        # serves) default open() to UTF-8 (PEP 540): our own call sites pass encoding=
+        # explicitly, but third-party code in those children reads configs with bare
+        # open(), which uses the ANSI codepage (GBK on zh-Windows). Too late for THIS
+        # process by design -- UTF-8 mode is fixed at interpreter startup.
+        os.environ.setdefault("PYTHONUTF8", "1")
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
         _print_help(sys.stderr)
