@@ -336,6 +336,8 @@ class ModelConfig:
     gguf_embedding_bf16: bool = False
     gguf_router_bf16: bool = False
     gguf_dense_bf16: bool = False
+    ftw_split_gdn: bool = False
+    ftw_lm_head_nvfp4: bool = False
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,

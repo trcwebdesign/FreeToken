@@ -171,6 +171,18 @@ __all__ = ["parse_config", "parse_gguf_config"]
 
 def parse_config(hf_config: Any) -> ModelConfig:
     text = getattr(hf_config, "text_config", hf_config)
+    from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+    ftw_path = getattr(hf_config, "_name_or_path", "")
+    ftw_split_gdn = is_ftw_checkpoint(ftw_path)
+    ftw_lm_head_nvfp4 = False
+    if ftw_split_gdn:
+        import json
+        with open(f"{ftw_path}/freetoken_weight.json", encoding="utf-8") as handle:
+            ftw_lm_head_nvfp4 = any(
+                item.get("name") == "lm_head.weight" and item.get("dtype") == "uint8"
+                for item in json.load(handle).get("tensors", ())
+            )
 
     head_dim = (
         getattr(text, "head_dim", None)
@@ -287,6 +299,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         ),
         gguf_block_count=getattr(hf_config, "gguf_block_count", None),
         gguf_tensor_types=getattr(hf_config, "gguf_tensor_types", None),
+        ftw_split_gdn=ftw_split_gdn,
+        ftw_lm_head_nvfp4=ftw_lm_head_nvfp4,
     )
 
 

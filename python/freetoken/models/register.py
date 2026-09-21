@@ -325,8 +325,11 @@ def _load_attr(module_path: str, attr_name: str) -> Any:
 def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
     """The checkpoint's QuantConfig under the family's naming, or None for GGUF, whose native-quant ops the shared parser does not model yet."""
     from freetoken.layers.quantization import NameMap, QuantConfig
+    from freetoken.checkpoint.ftw import is_ftw_checkpoint
 
-    if spec.parse_config == "parse_gguf_config":
+    # FTW stores dense tensors after the family loader has materialized them (usually
+    # BF16); only routed expert banks retain their native quantized representation.
+    if spec.parse_config == "parse_gguf_config" or is_ftw_checkpoint(model_path):
         return None
     return QuantConfig.from_hf(
         hf_config,

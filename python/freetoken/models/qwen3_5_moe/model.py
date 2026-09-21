@@ -45,6 +45,7 @@ class Qwen3_5DecoderLayer(BaseOP):
                 conv_kernel_size=g.conv_kernel_dim,
                 rms_norm_eps=config.rms_norm_eps,
                 layer_id=layer_id,
+                force_split_in_proj=config.ftw_split_gdn,
                 quant_config=config.quant,
                 prefix=f"{prefix}.linear_attn",
             )
@@ -110,6 +111,10 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
             prefix="lm_head",
         )
         super().__init__()
+        if config.ftw_lm_head_nvfp4:
+            from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
+
+            self.lm_head = Nvfp4LMHead(config.vocab_size, config.hidden_size)
         dense_nvfp4 = (
             getattr(config, "gguf_model_path", None) is not None
             and getattr(config, "gguf_tensor_types", None) is not None

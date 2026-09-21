@@ -369,7 +369,7 @@ _GEMMA_NORM_SUFFIXES = (
 )
 # leaves the model builds as Linear layers: only their tensors are read under the QuantConfig, the rest passes through as stored
 _LINEAR_LEAVES = frozenset({
-    "q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
+    "q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "in_proj_qkvz", "in_proj_ba", "out_proj",
     "gate_proj", "up_proj", "down_proj", "gate", "shared_expert_gate", "lm_head",
 })
 # activation scales of modules whose scheme carries no input_scale role
@@ -453,6 +453,11 @@ class _DenseReader:
         if self.quant is None:
             return None
         checkpoint_names = self.quant.name_map.to_checkpoint(module)
+        if module.endswith(".in_proj_qkvz"):
+            checkpoint_names += (
+                module.removesuffix(".in_proj_qkvz") + ".in_proj_qkv",
+                module.removesuffix(".in_proj_qkvz") + ".in_proj_z",
+            )
         for name in checkpoint_names:
             scheme = self.quant.scheme_for_name(name)
             if scheme is not None:
@@ -470,7 +475,16 @@ class _DenseReader:
             return module, 0, 1
         if len(candidates) > 1:
             # GDN: quantized checkpoints split qkv|z from the bf16 b|a; same test as gdn.py
-            split = self.scheme(f"{parent}.in_proj_qkvz") is not None
+            def has_scheme(name: str) -> bool:
+                return (
+                    self.scheme(name) is not None
+                    or (self.quant is not None and self.quant.scheme_for_name(name) is not None)
+                )
+
+            split = any(
+                has_scheme(f"{parent}.{leaf}")
+                for leaf in ("in_proj_qkvz", "in_proj_qkv", "in_proj_z")
+            )
             keep = {"in_proj_qkvz", "in_proj_ba"} if split else {"in_proj"}
             candidates = [c for c in candidates if c[0] in keep]
         fused, idx = candidates[0]
