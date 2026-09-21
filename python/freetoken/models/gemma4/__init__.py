@@ -4,6 +4,7 @@ from .gguf import (
     dummy_q4_0_expert_sources,
     iter_gguf_weights,
     load_q4_0_expert_sources,
+    load_q8_0_expert_sources,
     parse_gguf_config,
 )
 from .model import Gemma4ForCausalLM, Gemma4ForConditionalGeneration, Gemma4UnifiedForConditionalGeneration
@@ -35,5 +36,6 @@ __all__ = [
     "parse_gguf_config",
     "iter_gguf_weights",
     "load_q4_0_expert_sources",
+    "load_q8_0_expert_sources",
     "dummy_q4_0_expert_sources",
 ]

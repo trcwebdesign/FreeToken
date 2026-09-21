@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from typing import Any, Tuple
 
 import torch
@@ -74,6 +75,17 @@ class Qwen4ExpArgs:
 
 PLE_CONV_STATE = "ple_conv"
 PLE_NGRAM_STATE = "ple_ngram_ctx"
+
+
+def _quant_get(hf_config: Any):
+    quant = getattr(hf_config, "quantization_config", None)
+    if quant is None:
+        return None
+    return quant.get if isinstance(quant, dict) else (lambda key, default=None: getattr(quant, key, default))
+
+
+def _ignored(patterns, module_name: str) -> bool:
+    return any(fnmatch(module_name, pattern) for pattern in patterns)
 
 
 def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:

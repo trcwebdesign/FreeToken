@@ -218,7 +218,8 @@ class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):
         super().__init__(config)
         if config.is_multimodal:
             assert not config.vision_config.deepstack_visual_indexes, "Qwen3.8 consumes no DeepStack features"
-            self.visual = Qwen3VLVisionModel(config.vision_config, quant_config=config.quant, prefix="visual")
+            # Qwen3.8 quantizes the text tower only; vision tensors remain BF16.
+            self.visual = Qwen3VLVisionModel(config.vision_config, quant_config=None, prefix="visual")
 
 
 __all__ = [

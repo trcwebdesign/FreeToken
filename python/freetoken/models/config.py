@@ -334,6 +334,7 @@ class ModelConfig:
     gguf_block_count: int | None = None
     gguf_tensor_types: dict[str, int] | None = None
     gguf_embedding_bf16: bool = False
+    gguf_embedding_type: int | None = None
     gguf_router_bf16: bool = False
     gguf_dense_bf16: bool = False
     ftw_split_gdn: bool = False

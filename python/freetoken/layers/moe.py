@@ -432,6 +432,13 @@ class OffloadMoELayer(MoELayer):
             return fused_experts_gguf_q4_0(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
+        if fmt == "q8_0":
+            from freetoken.moe.fused_q4_0 import fused_experts_gguf_q8_0
+
+            gate_up, down = views
+            return fused_experts_gguf_q8_0(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
+            )
         if fmt == "q4_k":
             # Native GGUF Q4_K experts share the same packed bank layout as Q4_0 and
             # are decoded by the same grouped GEMV kernel; only the quant type changes.

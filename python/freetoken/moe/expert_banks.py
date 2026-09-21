@@ -172,6 +172,18 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
+def _q8_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    if parallel:
+        raise NotImplementedError("parallel reader not implemented for q8_0 GGUF experts")
+    from freetoken.models.weight import load_q8_0_moe_expert_sources
+
+    sink = None if dummy else layer_sink
+    sources = load_q8_0_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
+    return ExpertBanks(
+        "q8_0", {name: sources[name] for name in _BANK_SCHEMAS["q8_0"]}, streamed=sink is not None
+    )
+
+
 def _q4_k_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
     from freetoken.kernel.gguf import ggml_dequantize
     from freetoken.models.gguf.reader import iter_gguf_tensors
@@ -270,6 +282,7 @@ def _compressed_tensors_banks(model_path, model_config, device, dtype, dummy, pa
 # expert formats that still load through their own provider (GGUF)
 _PROVIDERS = {
     "q4_0": _q4_0_banks,
+    "q8_0": _q8_0_banks,
     "q4_k": _q4_k_banks,
     "nvfp4": _nvfp4_banks,
     "compressed-tensors": _compressed_tensors_banks,
@@ -459,7 +472,9 @@ def load_expert_banks(
         # layer modules while their routed experts still require the native
         # NVFP4 bank provider. Do not send those banks through the BF16 piece
         # reader, which has no stacked experts for a quantized checkpoint.
-        if method is not None and method.kind is not QuantKind.NONE and expert_quant != "compressed-tensors":
+        if method is not None and expert_quant != "compressed-tensors" and (
+            expert_quant == "none" or method.kind is not QuantKind.NONE
+        ):
             return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink)
         return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink)
 

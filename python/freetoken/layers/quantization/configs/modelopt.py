@@ -41,7 +41,9 @@ class ModelOptConfig(QuantConfig):
         super().__init__(name_map, unquantized)
         self.algo = str(q.get("quant_algo") or "").upper()
         # Inferact exports carry this key; false says the FP8 and NVFP4 layers store no input_scale, and an explicit value wins over the config_groups rule below
-        self.with_input_scale = q.get("with_input_scale")
+        # Older ModelOpt weight-only exports omit this key and store no activation
+        # scales; treat the missing value as W4A16/FP8-without-input-scale.
+        self.with_input_scale = q.get("with_input_scale", False)
         groups = q.get("config_groups")
         # an export with no activation quantizer can still say NVFP4; every config group then has input_activations null (vLLM applies the same rule)
         if self.with_input_scale is None and self.algo == "NVFP4" and isinstance(groups, dict) and groups and all(isinstance(g, dict) and g.get("input_activations") is None for g in groups.values()):

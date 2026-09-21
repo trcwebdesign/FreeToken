@@ -14,7 +14,7 @@ from __future__ import annotations
 import torch
 
 from freetoken.layers.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
-from freetoken.models.gguf.dequant import GGML_Q4_0, GGML_Q4_K
+from freetoken.models.gguf.dequant import GGML_Q4_0, GGML_Q8_0, GGML_Q4_K
 
 _ACT = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
 
@@ -70,6 +70,14 @@ def fused_experts_gguf_q4_0(
     )
 
 
+def fused_experts_gguf_q8_0(
+    hidden_states, gate_up_q, down_q, topk_weights, topk_ids, activation
+):
+    return fused_experts_gguf(
+        hidden_states, gate_up_q, down_q, topk_weights, topk_ids, activation, GGML_Q8_0
+    )
+
+
 def fused_experts_gguf_q4_k(
     hidden_states: torch.Tensor,
     gate_up_q: torch.Tensor,
@@ -89,4 +97,4 @@ def fused_experts_gguf_q4_k(
     )
 
 
-__all__ = ["fused_experts_gguf", "fused_experts_gguf_q4_0", "fused_experts_gguf_q4_k"]
+__all__ = ["fused_experts_gguf", "fused_experts_gguf_q4_0", "fused_experts_gguf_q8_0", "fused_experts_gguf_q4_k"]

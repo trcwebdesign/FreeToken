@@ -23,7 +23,7 @@ from freetoken.models.config import (
     RotaryConfig,
     SWAAttentionGroupConfig,
 )
-from freetoken.models.gguf.dequant import GGML_Q4_0, GGML_Q6_K, dequantize, row_bytes
+from freetoken.models.gguf.dequant import GGML_Q4_0, GGML_Q8_0, GGML_Q6_K, dequantize, row_bytes
 
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
@@ -102,6 +102,14 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         and t.ggml_type != 40
         for t in iter_gguf_tensors(shim.model_path)
     )
+    embedding_type = next(
+        (
+            t.ggml_type
+            for t in iter_gguf_tensors(shim.model_path)
+            if t.name in {"model.language_model.embed_tokens.weight", "token_embd.weight"}
+        ),
+        None,
+    )
     router_bf16 = any(
         (
             t.name.endswith(".router.proj.weight")
@@ -137,9 +145,11 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         model_type="gemma4",
         architectures=list(shim.architectures),
         moe_enabled=True,
-        expert_quant="nvfp4" if hf_nvfp4 else "q4_0",
-        moe_weight_format="nvfp4" if hf_nvfp4 else "q4_0",
+        expert_quant="nvfp4" if hf_nvfp4 else _gguf_expert_quant(shim.model_path),
+        moe_weight_format="nvfp4" if hf_nvfp4 else _gguf_expert_quant(shim.model_path),
         gguf_embedding_bf16=embedding_bf16,
+        gguf_embedding_type=embedding_type,
+        gguf_model_path=shim.model_path,
         gguf_router_bf16=router_bf16,
         gguf_dense_bf16=dense_bf16,
         use_qk_norm=True,
@@ -210,6 +220,24 @@ def _require_tp1(what: str) -> None:
             f"gemma4 GGUF {what} currently supports TP=1 only "
             "(GGUF quant layers and expert banks are not tensor-parallel sharded)."
         )
+
+
+def _gguf_expert_quant(model_path: str) -> str:
+    """Return the native GGML format used by the routed expert tensors."""
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    expert_types = {
+        t.ggml_type
+        for t in iter_gguf_tensors(model_path)
+        if "exps.weight" in t.name
+    }
+    if not expert_types:
+        return "q4_0"
+    if expert_types == {GGML_Q8_0}:
+        return "q8_0"
+    if expert_types == {GGML_Q4_0}:
+        return "q4_0"
+    raise ValueError(f"unsupported mixed GGUF expert quantization types: {sorted(expert_types)}")
 
 
 def iter_gguf_weights(
@@ -499,7 +527,7 @@ def _iter_hf_nvfp4_weights(model_path, device, include_moe_experts, include_non_
 
 def is_gguf_model(config: ModelConfig) -> bool:
     """True when the model was parsed from a GGUF checkpoint (native-quant path)."""
-    return getattr(config, "moe_weight_format", None) in ("q4_0", "nvfp4")
+    return getattr(config, "moe_weight_format", None) in ("q4_0", "q8_0", "nvfp4")
 
 
 class GGUFTiedLMHead:
@@ -589,7 +617,7 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
     """In place: replace gemma4's dense projections + embedding with native GGUF ops.
 
     Quantized in the checkpoint -> swapped: attention qkv/o, shared-MLP gate_up/down
-    (all Q4_0) and the token embedding (Q6_K, also the tied LM head). Left as dense
+    (all Q4_0) and the token embedding (native GGUF type, also the tied LM head). Left as dense
     bf16 (F32 in the GGUF): the router gate, all RMSNorms, the per-layer scalars, and
     the routed experts (served from the offload cache).
     """
@@ -627,7 +655,17 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
 
     from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear
 
-    def swap_linear(owner, attr, quant_type=GGML_Q4_0):
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    tensor_types = {t.name: t.ggml_type for t in iter_gguf_tensors(config.gguf_model_path)}
+
+    def tensor_type(name: str) -> int:
+        try:
+            return tensor_types[name]
+        except KeyError as exc:
+            raise ValueError(f"GGUF tensor type is missing for {name}") from exc
+
+    def swap_linear(owner, attr, quant_type):
         lin = getattr(owner, attr)
         out_features, in_features = lin.weight.shape
         setattr(
@@ -637,22 +675,34 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
         )
 
     inner = model.model
+    embedding_type = config.gguf_embedding_type
+    if embedding_type is None:
+        raise ValueError("GGUF embedding quantization type is missing from the model config")
     embed = GGUFEmbedding(
         num_embeddings=config.vocab_size,
         embedding_dim=config.hidden_size,
-        quant_type=GGML_Q6_K,
+        quant_type=embedding_type,
         embed_scale=config.embedding_scale,
     )
     inner.embed_tokens = embed
 
-    for layer in inner.layers.op_list:
-        swap_linear(layer.self_attn, "qkv_proj")
-        swap_linear(layer.self_attn, "o_proj")
-        swap_linear(layer.feed_forward.shared_mlp, "gate_up_proj")
-        swap_linear(layer.feed_forward.shared_mlp, "down_proj")
+    for layer_id, layer in enumerate(inner.layers.op_list):
+        prefix = f"blk.{layer_id}."
+        swap_linear(layer.self_attn, "qkv_proj", tensor_type(prefix + "attn_q.weight"))
+        swap_linear(layer.self_attn, "o_proj", tensor_type(prefix + "attn_output.weight"))
+        swap_linear(
+            layer.feed_forward.shared_mlp,
+            "gate_up_proj",
+            tensor_type(prefix + "ffn_gate.weight"),
+        )
+        swap_linear(
+            layer.feed_forward.shared_mlp,
+            "down_proj",
+            tensor_type(prefix + "ffn_down.weight"),
+        )
 
     if config.tie_word_embeddings:
-        model.lm_head = GGUFTiedLMHead(embed, GGML_Q6_K)
+        model.lm_head = GGUFTiedLMHead(embed, embedding_type)
 
 
 # --------------------------------------------------------------------------------------
@@ -697,8 +747,14 @@ def load_q4_0_expert_sources(
     from freetoken.models.gguf.reader import iter_gguf_tensors
 
     tensors = {t.name: t for t in iter_gguf_tensors(model_path)}
+    gate_up_names = [
+        f"blk.{layer}.ffn_gate_up_exps.weight"
+        if f"blk.{layer}.ffn_gate_up_exps.weight" in tensors
+        else f"blk.{layer}.ffn_gate_exps.weight"
+        for layer in range(L)
+    ]
     hb = {
-        "gate_up": [HostBank((E, 2 * I, tensors[f"blk.{layer}.ffn_gate_exps.weight"].row_bytes), torch.uint8) for layer in range(L)],
+        "gate_up": [HostBank((E, 2 * I, tensors[name].row_bytes), torch.uint8) for name in gate_up_names],
         "down": [HostBank((E, H, tensors[f"blk.{layer}.ffn_down_exps.weight"].row_bytes), torch.uint8) for layer in range(L)],
     }
     banks = {name: [b.tensor for b in hb[name]] for name in hb}
@@ -711,7 +767,10 @@ def load_q4_0_expert_sources(
             if not t.name.startswith("blk."):
                 continue
             layer = int(t.name.split(".")[1])
-            if t.name.endswith("ffn_gate_exps.weight") or t.name.endswith("ffn_up_exps.weight"):
+            if t.name.endswith("ffn_gate_up_exps.weight"):
+                banks["gate_up"][layer].copy_(t.packed().reshape(E, 2 * I, t.row_bytes))
+                seen_gu.add(layer)
+            elif t.name.endswith("ffn_gate_exps.weight") or t.name.endswith("ffn_up_exps.weight"):
                 slot = "gate" if t.name.endswith("ffn_gate_exps.weight") else "up"
                 parts = pending_gu.setdefault(layer, {})
                 parts[slot] = t.packed().reshape(E, I, t.row_bytes)
@@ -741,6 +800,14 @@ def load_q4_0_expert_sources(
         f"down {sorted(want - seen_dn)}"
     )
     return banks
+
+
+def load_q8_0_expert_sources(
+    model_path: str, config: ModelConfig, *, layer_sink=None
+) -> dict[str, list[torch.Tensor]]:
+    return load_q4_0_expert_sources(
+        model_path, config, layer_sink=layer_sink, quant_type=GGML_Q8_0
+    )
 
 
 def load_nvfp4_expert_sources(
@@ -817,6 +884,7 @@ __all__ = [
     "convert_gemma4_to_gguf",
     "is_gguf_model",
     "load_q4_0_expert_sources",
+    "load_q8_0_expert_sources",
     "load_nvfp4_expert_sources",
     "dummy_q4_0_expert_sources",
 ]

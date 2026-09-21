@@ -62,7 +62,7 @@ _NVFP4_CT_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     global_reciprocal=True,
 )
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
-_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".weight_scale_inv", ".input_scale")
+_SCALE_SUFFIXES = (".weight_scale_2", ".weight_scale_inv", ".input_scale")
 
 # The n-gram table itself: too big for the dense state dict, loaded by load_ple_table.
 _PLE_TABLE_INFIX = ".ple.ple_embedding.ngram_embedding."
@@ -91,7 +91,7 @@ _ZERO_CENTERED_NORM_SUFFIXES = (
 # The top-level hyper_connection_mixer has no injection and never fuses.
 _PAD_TO = {"input_mix_weight_down_block_inject": 16}
 _HC_WITH_INJECT = (".attn_hyper_connection", ".mlp_hyper_connection")
-_KIND_SUFFIXES = (".weight_scale_inv", ".weight")
+_KIND_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".weight")
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 _ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn}
 
@@ -154,9 +154,12 @@ class _DenseFuser:
     def check(self, module: str, name: str, tensor: torch.Tensor) -> None:
         """``tensor`` (checkpoint key ``name``) must match the scheme the model built ``module`` from."""
         scheme = self.scheme(module)
-        if name.endswith(".weight_scale_inv"):
-            if scheme is None or not scheme.has("weight_scale_inv"):
+        if name.endswith(".weight_scale_inv") or name.endswith(".weight_scale"):
+            role = "weight_scale_inv" if name.endswith(".weight_scale_inv") else "weight_scale"
+            if scheme is None or not scheme.has(role):
                 raise ValueError(f"{name}: {module} has no block scale in the checkpoint's quant config ({scheme})")
+            if role == "weight_scale" and tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+                raise ValueError(f"{name} has unsupported scale dtype {tensor.dtype}")
             return
         is_fp8 = tensor.dtype in _FP8_DTYPES
         if scheme is None:
@@ -200,38 +203,16 @@ class _DenseFuser:
         return [(fused + kind, torch.cat(rows, dim=0))]
 
 def _load_maybe_quantized(reader: ShardReader, raw_name: str) -> torch.Tensor:
-    """Load a weight, dequantizing dense FP8 tensors to the fusion dtype.
+    """Load checkpoint storage without dequantizing quantized modules.
 
-    Quantization siblings can be stored in a different safetensors shard. Packed NVFP4
-    weights are uint8 and remain untouched because routed experts use their bank loader.
+    Quantized layers own their dequantization/GEMM kernel and require the raw FP8 weight
+    together with its scale tensor. Dequantizing here turns a quantized model buffer into
+    BF16 and causes a state-dict mismatch during load.
     """
     tensor = reader.get_tensor(raw_name)
-    if not raw_name.endswith(".weight") or tensor.dtype == torch.uint8:
-        return tensor
-
-    def _get_optional(name: str) -> torch.Tensor | None:
-        try:
-            return reader.get_tensor(name)
-        except KeyError:
-            return None
-
-    base = raw_name[: -len(".weight")]
-    inverse_scale_name = base + ".weight_scale_inv"
-    inverse_scale = _get_optional(inverse_scale_name)
-    if inverse_scale is not None:
-        from freetoken.kernel.triton.fp8_block_linear import dequant_block_fp8
-
-        return dequant_block_fp8(tensor, inverse_scale)
-
-    scale_name = base + ".weight_scale"
-    scale = _get_optional(scale_name)
-    if scale is not None and tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        scale = scale.to(torch.bfloat16)
-        if scale.numel() == tensor.shape[0] and scale.ndim == 1:
-            scale = scale.reshape(-1, 1)
-        return tensor.to(torch.bfloat16) * scale
-
-    return tensor.to(torch.bfloat16) if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) else tensor
+    if raw_name.endswith(".weight_scale"):
+        return tensor.to(torch.float32).reshape(-1)
+    return tensor
 
 
 
@@ -272,9 +253,12 @@ class _DenseFuser:
     def check(self, module: str, name: str, tensor: torch.Tensor) -> None:
         """``tensor`` (checkpoint key ``name``) must match the scheme the model built ``module`` from."""
         scheme = self.scheme(module)
-        if name.endswith(".weight_scale_inv"):
-            if scheme is None or not scheme.has("weight_scale_inv"):
+        if name.endswith(".weight_scale_inv") or name.endswith(".weight_scale"):
+            role = "weight_scale_inv" if name.endswith(".weight_scale_inv") else "weight_scale"
+            if scheme is None or not scheme.has(role):
                 raise ValueError(f"{name}: {module} has no block scale in the checkpoint's quant config ({scheme})")
+            if role == "weight_scale" and tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+                raise ValueError(f"{name} has unsupported scale dtype {tensor.dtype}")
             return
         is_fp8 = tensor.dtype in _FP8_DTYPES
         if scheme is None:
