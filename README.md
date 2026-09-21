@@ -21,7 +21,7 @@ The Windows disk tier keeps only a configurable prefix of routed experts in host
 Example for a 128 GiB RAM system:
 
 ```cmd
-ft serve --model "C:\Users\USER\.freetoken\models\Qwen3.8-Flash-Next-Uncensored-NVFP4" --port 1919 --moe-strategy offload --moe-disk-tier on --expert-ram-experts 128 --disk-fetch-workers 16 --disable-moe-prefill-overlap --cuda-graph-max-bs 0 --max-running-requests 4 --memory-ratio 0.95 --host 0.0.0.0 --cors-origins "*"
+ft serve --model "%USERPROFILE%\.freetoken\models\Qwen3.8-Flash-Next-Uncensored-NVFP4" --port 1919 --moe-strategy offload --moe-disk-tier on --expert-ram-experts 128 --disk-fetch-workers 16 --disable-moe-prefill-overlap --cuda-graph-max-bs 0 --max-running-requests 4 --memory-ratio 0.95 --host 0.0.0.0 --cors-origins "*"
 ```
 
 The disk-tier prototype currently targets Qwen4Exp/Qwen3.8 native NVFP4 checkpoints, GPU offload, disabled MoE prefill overlap, and disabled CUDA graphs. It uses Windows-compatible file reads and does not depend on Linux `io_uring`, `O_DIRECT`, or `preadv`.
