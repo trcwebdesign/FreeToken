@@ -10,6 +10,30 @@
 | <a href="https://www.flashml.ai/"><b>Download</b></a> | <a href="https://arxiv.org/abs/2608.16157"><b>Paper</b></a> | <a href="https://join.slack.com/t/flashml/shared_invite/zt-3zpdh5j10-9dwTXrgLiqpVxizhA9KVbA"><b>Developer Slack</b></a> | <a href="https://discord.gg/MsA277cJzZ"><b>Community Discord</b></a> | <a href="https://github.com/FlashML-org/FreeToken/issues/482"><b>Community WeChat</b></a> |
 </p>
 
+## Windows NVFP4 Fork Enhancements
+
+This fork adds Windows-focused support for serving large Qwen3.8 and Gemma4 NVFP4/GGUF checkpoints on consumer hardware.
+
+### Disk-tier MoE offload
+
+The Windows disk tier keeps only a configurable prefix of routed experts in host RAM and fetches the remaining NVFP4 expert rows directly from the original safetensors files when needed. This avoids materializing the full expert bank in memory or requiring a page file large enough for the entire model.
+
+Example for a 128 GiB RAM system:
+
+```cmd
+ft serve --model "C:\Users\USER\.freetoken\models\Qwen3.8-Flash-Next-Uncensored-NVFP4" --port 1919 --moe-strategy offload --moe-disk-tier on --expert-ram-experts 128 --disk-fetch-workers 16 --disable-moe-prefill-overlap --cuda-graph-max-bs 0 --max-running-requests 4 --memory-ratio 0.95 --host 0.0.0.0 --cors-origins "*"
+```
+
+The disk-tier prototype currently targets Qwen4Exp/Qwen3.8 native NVFP4 checkpoints, GPU offload, disabled MoE prefill overlap, and disabled CUDA graphs. It uses Windows-compatible file reads and does not depend on Linux `io_uring`, `O_DIRECT`, or `preadv`.
+
+### Checkpoint and Windows fixes
+
+- Native Q8_0 Gemma4 GGUF embeddings, projections, and routed experts.
+- Qwen3.8 FP8 GDN loading with preserved weight scales.
+- BF16 Qwen3.8 vision-tower loading alongside the quantized text tower.
+- Windows-safe expert-bank residency and stale compiled-module shadow handling.
+- GGUF tokenizer, metadata, and model-repair utilities for local checkpoints.
+
 
 Unlock datacenter-class intelligence on the hardware you already own — Run 290B+ frontier MoE models locally on your gaming PC at blistering interactive speeds.
 
