@@ -542,7 +542,12 @@ def load_nvfp4_expert_sources_parallel(
 
 
 def nvfp4_expert_spec(model_path: str, config):
-    return _NVFP4_SOURCE_SPEC
+    try:
+        quant = cached_load_hf_config(model_path).quantization_config
+        method = quant.get("quant_method") if isinstance(quant, dict) else getattr(quant, "quant_method", None)
+    except (AttributeError, KeyError, TypeError):
+        method = None
+    return _NVFP4_CT_SOURCE_SPEC if str(method or "").lower() == "compressed-tensors" else _NVFP4_SOURCE_SPEC
 
 
 __all__ = [

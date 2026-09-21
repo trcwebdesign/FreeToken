@@ -48,6 +48,8 @@ class ExpertBanks:
     kind: QuantKind | None = None
     kernel: str | None = None
     layout: dict | None = None
+    disk_index: object | None = None
+    disk_ram_experts: int | None = None
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
@@ -210,30 +212,35 @@ def _q4_k_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     return ExpertBanks("bf16", banks, streamed=layer_sink is not None and not dummy)
 
 
-def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None, disk_tier=None) -> ExpertBanks:
     if parallel:
         raise NotImplementedError(
             "parallel reader not implemented for nvfp4 GGUF: use the GGUF-native reader"
         )
-    if getattr(model_config, "model_type", "") == "qwen3_5_moe" and os.path.isdir(model_path):
+    if getattr(model_config, "model_type", "") in ("qwen3_5_moe", "qwen4_exp") and os.path.isdir(model_path):
         from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
-        from freetoken.models.qwen3_5_moe.weight import nvfp4_expert_spec
+        if getattr(model_config, "model_type", "") == "qwen4_exp":
+            from freetoken.models.qwen4_exp.weight import nvfp4_expert_spec
+        else:
+            from freetoken.models.qwen3_5_moe.weight import nvfp4_expert_spec
         from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
 
         E, H, I, L = model_config.num_experts, model_config.hidden_size, model_config.moe_intermediate_size, model_config.num_moe_layers
+        ram = E if disk_tier is None else disk_tier.ram_experts
         hb = alloc_layer_banks({
-            "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
-            "gate_up_scale": ((E, 2 * I, H // 16), torch.float8_e4m3fn),
-            "gate_up_global": ((E, 2 * I), torch.float16),
-            "down_packed": ((E, H, I // 2), torch.uint8),
-            "down_scale": ((E, H, I // 16), torch.float8_e4m3fn),
-            "down_global": ((E, H), torch.float16),
+            "gate_up_packed": ((ram, 2 * I, H // 2), torch.uint8),
+            "gate_up_scale": ((ram, 2 * I, H // 16), torch.float8_e4m3fn),
+            "gate_up_global": ((ram, 2 * I), torch.float16),
+            "down_packed": ((ram, H, I // 2), torch.uint8),
+            "down_scale": ((ram, H, I // 16), torch.float8_e4m3fn),
+            "down_global": ((ram, H), torch.float16),
         }, L)
         banks = {name: [bank.tensor for bank in layers] for name, layers in hb.items()}
-        seen = torch.zeros(L, E, dtype=torch.bool)
+        seen = torch.zeros(L, ram, dtype=torch.bool)
         pieces = iter_nvfp4_expert_pieces(
             model_path, model_config, nvfp4_expert_spec(model_path, model_config),
             parallel=False, workers=workers, chunk=chunk,
+            skip_experts_from=None if disk_tier is None else ram,
         )
         def global_rows(value: torch.Tensor, rows: int) -> torch.Tensor:
             value = value.reshape(value.shape[0], -1)
@@ -254,7 +261,12 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
         if not bool(seen.all()):
             raise ValueError(f"Qwen NVFP4 expert banks were not filled: {(~seen).nonzero().tolist()[:4]}")
         pin_banks(hb)
-        return ExpertBanks("nvfp4", banks, streamed=False)
+        disk_index = None
+        if disk_tier is not None:
+            from freetoken.moe.disk_tier import Nvfp4DiskIndex
+            disk_index = Nvfp4DiskIndex(model_path, model_config, nvfp4_expert_spec(model_path, model_config))
+        return ExpertBanks("nvfp4", banks, streamed=False, disk_index=disk_index,
+                           disk_ram_experts=ram)
     elif getattr(model_config, "model_type", "") == "qwen3_5_moe":
         from freetoken.models.qwen3_5_moe.weight import load_nvfp4_expert_sources
     else:
@@ -289,17 +301,25 @@ _PROVIDERS = {
 }
 
 
-def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None, disk_tier=None) -> ExpertBanks:
     expert_quant = model_config.expert_quant
+    # Disk tier owns the native Qwen4Exp NVFP4 source path even when the model
+    # layers bind an MoE quant method and expose expert_quant as "none".
+    if disk_tier is not None and getattr(model_config, "model_type", "") == "qwen4_exp":
+        expert_quant = "nvfp4"
     if expert_quant not in _PROVIDERS:
         raise ValueError(
             f"{expert_quant!r} experts load through their MoE quant method; "
             f"only {sorted(_PROVIDERS)} still have a format provider"
         )
-    return _PROVIDERS[expert_quant](
-        model_path, model_config, device, dtype, dummy,
+    kwargs = dict(
         parallel=parallel, workers=workers, chunk=chunk, decode_target=decode_target,
         layer_sink=layer_sink,
+    )
+    if disk_tier is not None:
+        kwargs["disk_tier"] = disk_tier
+    return _PROVIDERS[expert_quant](
+        model_path, model_config, device, dtype, dummy, **kwargs
     )
 
 
@@ -397,6 +417,7 @@ def load_expert_banks(
     decode_target: str = "gpu",
     layer_sink=None,
     layer_residency: list[str] | None = None,
+    disk_tier=None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -472,11 +493,11 @@ def load_expert_banks(
         # layer modules while their routed experts still require the native
         # NVFP4 bank provider. Do not send those banks through the BF16 piece
         # reader, which has no stacked experts for a quantized checkpoint.
-        if method is not None and expert_quant != "compressed-tensors" and (
+        if disk_tier is None and method is not None and expert_quant != "compressed-tensors" and (
             expert_quant == "none" or method.kind is not QuantKind.NONE
         ):
             return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink)
-        return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink)
+        return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink, disk_tier)
 
     with requested_residency(layer_residency) as residency_plan:
         try:

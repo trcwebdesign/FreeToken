@@ -657,6 +657,21 @@ class Engine:
         # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
         # pick (parallel for scattered experts, with a low-RAM fallback to serial).
         expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
+        disk_tier = None
+        if config.moe_disk_tier == "on":
+            from freetoken.moe.disk_tier import DiskTierSpec
+
+            if getattr(config.model_config, "model_type", "") != "qwen4_exp":
+                raise ValueError("--moe-disk-tier currently supports native qwen4_exp NVFP4 only")
+            if not 0 < config.expert_ram_experts < config.model_config.num_experts:
+                raise ValueError(
+                    f"--expert-ram-experts must be in (0, {config.model_config.num_experts})"
+                )
+            if decode_target != "gpu" or config.moe_prefill_overlap:
+                raise ValueError("--moe-disk-tier requires GPU offload and prefill overlap disabled")
+            if config.cuda_graph_max_bs != 0:
+                raise ValueError("--moe-disk-tier requires --cuda-graph-max-bs 0")
+            disk_tier = DiskTierSpec(config.expert_ram_experts)
         requested_residency = None
         if split_residency:
             from freetoken.moe.host_banks import HostResidency
@@ -678,6 +693,7 @@ class Engine:
                     parallel=expert_parallel,
                     decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                     layer_residency=requested_residency,
+                    disk_tier=disk_tier,
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
@@ -700,7 +716,7 @@ class Engine:
             )
         _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
         layout = max_slots = None
-        if method is not None:
+        if method is not None and disk_tier is None:
             if banks.kind is not None and (banks.kind, banks.kernel) != (method.kind, method.kernel.name):
                 raise ValueError(
                     f"expert banks were packed for {banks.kind} / {banks.kernel} but the model "
@@ -723,10 +739,15 @@ class Engine:
             hybrid_max_fetch=config.moe_hybrid_max_fetch,
             layout=layout,
             max_slots=max_slots,
+            disk_ram_experts=None if disk_tier is None else config.expert_ram_experts,
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+        if banks.disk_index is not None:
+            cache.attach_disk_tier(
+                banks.disk_index, banks.disk_ram_experts, workers=config.disk_fetch_workers
+            )
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)

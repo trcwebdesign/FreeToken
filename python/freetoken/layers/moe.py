@@ -89,7 +89,7 @@ class MoELayer(BaseOP):
                 self.quant_method.create_weights(self)
 
     def finalize(self) -> None:
-        if self.quant_method is not None:
+        if self.quant_method is not None and not cache.disk_tier_enabled:
             self.quant_method.finalize(self)
 
     def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -412,7 +412,7 @@ class OffloadMoELayer(MoELayer):
         alphas: tuple[torch.Tensor, torch.Tensor] | None,
         is_prefill: bool,
     ) -> torch.Tensor:
-        if self.quant_method is not None:
+        if self.quant_method is not None and not cache.disk_tier_enabled:
             from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
 
             view = ExpertView(
