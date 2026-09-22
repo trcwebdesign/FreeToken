@@ -335,6 +335,18 @@ def _method_expert_banks(model_path, model_config, method, device, dummy, parall
     return build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink)
 
 
+def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None) -> ExpertBanks:
+    from freetoken.moe.expert_pieces import iter_expert_pieces
+
+    num_layers = model_config.num_moe_layers
+    if dummy:
+        return build_expert_banks(method, num_layers, None, device=device, dummy=True)
+    pieces = iter_expert_pieces(
+        model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk
+    )
+    return build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink)
+
+
 def _host_ram_fits_parallel(model_path: str) -> bool:
     """Best-effort: can free host RAM hold the expert banks plus the parallel reader's one
     extra (non-reclaimable) whole-shard buffer? Unknown (non-local path / no /proc) -> True,

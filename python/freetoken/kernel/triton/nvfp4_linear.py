@@ -886,7 +886,4 @@ __all__ = [
     "nvfp4_dense_linear",
     "nvfp4_dense_linear_t",
     "nvfp4_transpose_resident",
-    "Nvfp4DenseLinear",
-    "Nvfp4DenseColMerged",
-    "Nvfp4LMHead",
 ]

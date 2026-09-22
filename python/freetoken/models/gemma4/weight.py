@@ -97,8 +97,8 @@ def _dequant_ct_fp8_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.T
     return weight.to(torch.bfloat16) * scale.to(torch.bfloat16)
 
 
-def _emit_nvfp4_dense_mlp(f, base: str, raw_base: str, buf: dict):
-    """(key, tensor) triples for an NVFP4 dense MLP projection: down_proj standalone;
+def _emit_nvfp4_dense_mlp(reader: ShardReader, base: str, raw_base: str, buf: dict):
+    """(key, tensor) pairs for an NVFP4 dense MLP projection: down_proj standalone;
     gate_proj/up_proj merged output-wise into gate_up_proj (each keeps its own scales, so the
     fused weight is exact). Returns [] while a gate/up merge is still buffered."""
     w, s, g, a = _nvfp4_dense_parts(reader, raw_base)
