@@ -10,7 +10,7 @@ from freetoken.moe.offload_cache import OffloadMoeCache
 
 
 from .base import BaseOP
-from .quantization import ExpertView, LayerKind, QuantConfig, quant_method_for
+from .quantization import ExpertView, LayerKind, QuantConfig, QuantKind, quant_method_for
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -89,7 +89,11 @@ class MoELayer(BaseOP):
                 self.quant_method.create_weights(self)
 
     def finalize(self) -> None:
-        if self.quant_method is not None and not cache.disk_tier_enabled:
+        if (
+            self.quant_method is not None
+            and self.quant_method.kind is not QuantKind.NONE
+            and not cache.disk_tier_enabled
+        ):
             self.quant_method.finalize(self)
 
     def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -412,7 +416,11 @@ class OffloadMoELayer(MoELayer):
         alphas: tuple[torch.Tensor, torch.Tensor] | None,
         is_prefill: bool,
     ) -> torch.Tensor:
-        if self.quant_method is not None and not cache.disk_tier_enabled:
+        if (
+            self.quant_method is not None
+            and self.quant_method.kind is not QuantKind.NONE
+            and not cache.disk_tier_enabled
+        ):
             from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
 
             view = ExpertView(

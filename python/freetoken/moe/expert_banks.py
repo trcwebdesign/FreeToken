@@ -303,9 +303,9 @@ _PROVIDERS = {
 
 def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None, disk_tier=None) -> ExpertBanks:
     expert_quant = model_config.expert_quant
-    # Disk tier owns the native Qwen4Exp NVFP4 source path even when the model
-    # layers bind an MoE quant method and expose expert_quant as "none".
-    if disk_tier is not None and getattr(model_config, "model_type", "") == "qwen4_exp":
+    # Qwen4Exp's dense modules may be unquantized while routed experts remain native
+    # NVFP4; both ordinary offload and disk tier use the format-specific source reader.
+    if getattr(model_config, "model_type", "") == "qwen4_exp" and getattr(model_config, "expert_quant", "none") == "none":
         expert_quant = "nvfp4"
     if expert_quant not in _PROVIDERS:
         raise ValueError(
@@ -505,8 +505,16 @@ def load_expert_banks(
         # layer modules while their routed experts still require the native
         # NVFP4 bank provider. Do not send those banks through the BF16 piece
         # reader, which has no stacked experts for a quantized checkpoint.
-        if disk_tier is None and method is not None and expert_quant != "compressed-tensors" and (
-            expert_quant == "none" or method.kind is not QuantKind.NONE
+        qwen4_native_nvfp4 = (
+            getattr(model_config, "model_type", "") == "qwen4_exp"
+            and expert_quant == "none"
+        )
+        if (
+            disk_tier is None
+            and method is not None
+            and not qwen4_native_nvfp4
+            and expert_quant != "compressed-tensors"
+            and (expert_quant == "none" or method.kind is not QuantKind.NONE)
         ):
             return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink)
         return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink, disk_tier)

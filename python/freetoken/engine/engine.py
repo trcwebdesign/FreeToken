@@ -14,7 +14,13 @@ from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
-from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quant, set_quant_backend
+from freetoken.layers.quantization import (
+    LayerKind,
+    QuantBackend,
+    QuantKind,
+    finalize_quant,
+    set_quant_backend,
+)
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
@@ -823,8 +829,13 @@ class Engine:
             device=self.device,
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
-            # FIXME: the None branch serves GGUF q4_0 banks, which have no quant method yet; drop it once GGUF joins the quant path
-            fmt=sample.quant_method.cpu_format if sample.quant_method is not None else None,
+            # Native-format providers (GGUF/Qwen NVFP4) keep packed banks in the
+            # offload cache while their layer method may be QuantKind.NONE.
+            fmt=(
+                cache.quant_format
+                if sample.quant_method is None or sample.quant_method.kind is QuantKind.NONE
+                else sample.quant_method.cpu_format
+            ),
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
@@ -1445,7 +1456,12 @@ def shared_offload_method(model):
     """The expert method every offload MoE layer of ``model`` uses, or None for models whose MoE layers carry none (GGUF).
 
     The offload cache holds one bank layout, so the layers must agree on (kind, kernel)."""
-    layers = [l for l in iter_offload_moe_layers(model) if getattr(l, "quant_method", None) is not None]
+    layers = [
+        l
+        for l in iter_offload_moe_layers(model)
+        if getattr(l, "quant_method", None) is not None
+        and l.quant_method.kind is not QuantKind.NONE
+    ]
     if not layers:
         return None
     keys = {(layer.quant_method.kind, layer.quant_method.kernel.name) for layer in layers}
