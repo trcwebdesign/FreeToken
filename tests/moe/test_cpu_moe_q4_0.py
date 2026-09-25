@@ -89,6 +89,75 @@ def _dequant_bank(packed: torch.Tensor, K: int, dev) -> torch.Tensor:
     return flat.reshape(S, OUT, K).to(dev)
 
 
+def _pack_q8_0(values: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Pack [S, OUT, K] values into native Q8_0 rows [S, OUT, K//32*34]."""
+    S, OUT, K = values.shape
+    blocks = values.reshape(S, OUT, K // 32, 32)
+    scales = scale.to(torch.float16).view(torch.uint8).reshape(S, OUT, K // 32, 2)
+    return torch.cat([scales, blocks.view(torch.uint8)], dim=-1).reshape(S, OUT, K // 32 * 34).contiguous()
+
+
+def _make_q8_0_cache(L, E, H, I, seed=0):
+    from freetoken.kernel.pinned import alloc_pinned_tensor
+
+    torch.manual_seed(seed)
+    S = L * E
+
+    def rows(OUT, K):
+        values = torch.randint(-127, 128, (S, OUT, K), dtype=torch.int8)
+        scale = 0.002 + 0.008 * torch.rand(S, OUT, K // 32)
+        packed = _pack_q8_0(values, scale)
+        pinned = alloc_pinned_tensor(*packed.shape, dtype=torch.uint8)
+        pinned.copy_(packed)
+        return pinned
+
+    return SimpleNamespace(
+        quant_format="q8_0",
+        bank_sources={"gate_up": list(rows(2 * I, H).split(E)), "down": list(rows(H, I).split(E))},
+        num_layers=L,
+        num_experts=E,
+        decode_target="cpu",
+        cpu_executor=None,
+    )
+
+
+@pytest.mark.parametrize("bs", [1, 3])
+def test_cpu_decode_q8_0_matches_dequant_then_gpu(bs):
+    """CPU Q8_0 W8A16 GEMV matches reference dequantization plus GPU decode."""
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+    from freetoken.moe.fused import fused_experts_decode_impl
+
+    torch.manual_seed(500 + bs)
+    L, E, H, I, top_k = 2, 8, 256, 64, 4
+    layer = 1
+    dev = torch.device("cuda")
+    cache = _make_q8_0_cache(L, E, H, I)
+    ex = CpuMoeExecutor(
+        cache, top_k=top_k, activation="gelu_tanh", apply_router_weight_on_input=False,
+        num_threads=4, max_tokens=bs, device=dev,
+    )
+
+    hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16) * 0.5
+    ids = torch.stack([torch.randperm(E, device=dev)[:top_k] for _ in range(bs)]).to(torch.int32)
+    weights = torch.rand(bs, top_k, device=dev, dtype=torch.float32)
+    cpu_out = ex.decode(layer, hidden, weights, ids).float()
+    torch.cuda.synchronize()
+
+    from freetoken.models.gguf.dequant import GGML_Q8_0, dequantize
+
+    gate_up_raw = cache.bank_sources["gate_up"][layer]
+    down_raw = cache.bank_sources["down"][layer]
+    gate_up = dequantize(gate_up_raw.reshape(-1), GGML_Q8_0, torch.bfloat16).reshape(
+        E, 2 * I, H
+    ).to(dev)
+    down = dequantize(down_raw.reshape(-1), GGML_Q8_0, torch.bfloat16).reshape(E, H, I).to(dev)
+    gpu_out = fused_experts_decode_impl(
+        hidden, gate_up, down, weights, ids.clone(), "gelu_tanh", False
+    ).float()
+    rel = (cpu_out - gpu_out).abs().max() / (gpu_out.abs().max() + 1e-6)
+    assert rel < 2e-2, f"q8_0 bs={bs} rel err {rel.item()}"
+
+
 def _make_q4_0_cache(L, E, H, I, seed=0):
     """Random but valid native Q4_0 banks for the cpu backend (pinned host tensors)."""
     from freetoken.kernel.pinned import alloc_pinned_tensor
