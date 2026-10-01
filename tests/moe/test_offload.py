@@ -76,6 +76,15 @@ def test_dummy_expert_banks_follow_the_kernel_layout(monkeypatch):
     assert torch.all(banks.sources["gate_up_global"][0].float() > 0)
 
 
+def test_shared_offload_method_can_select_unquantized_hf_moe():
+    from freetoken.engine.engine import shared_offload_method
+
+    layer = _bf16_offload_layer(0, 4, 2, 8, 16)
+
+    assert shared_offload_method(layer) is None
+    assert shared_offload_method(layer, include_unquantized=True) is layer.quant_method
+
+
 def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypatch):
     layer, cache = _make_layer_and_cache()
     topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)

@@ -620,7 +620,13 @@ class Engine:
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
-        method = shared_offload_method(self.model)
+        method = shared_offload_method(
+            self.model,
+            include_unquantized=(
+                config.model_config.expert_quant == "none"
+                and config.model_config.moe_weight_format is None
+            ),
+        )
         num_moe_layers = config.model_config.num_moe_layers
         cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
         _check_pin_budget(config, reserved=self._host_tables_bytes, method=method)
@@ -1452,16 +1458,24 @@ def _adjust_ftw_quant_backend(model_path: str, quant_backend: QuantBackend) -> Q
     return QuantBackend(quant_backend.items + (((LayerKind.MOE, kind), kernel),))
 
 
-def shared_offload_method(model):
-    """The expert method every offload MoE layer of ``model`` uses, or None for models whose MoE layers carry none (GGUF).
+def shared_offload_method(model, *, include_unquantized: bool = False):
+    """Return the common method, or None when native-format experts use a separate provider.
 
+    ``include_unquantized`` opts ordinary BF16 experts into the generic bank reader.
     The offload cache holds one bank layout, so the layers must agree on (kind, kernel)."""
+    all_layers = list(iter_offload_moe_layers(model))
     layers = [
         l
-        for l in iter_offload_moe_layers(model)
+        for l in all_layers
         if getattr(l, "quant_method", None) is not None
         and l.quant_method.kind is not QuantKind.NONE
     ]
+    if not layers and include_unquantized:
+        layers = [
+            layer for layer in all_layers
+            if getattr(layer, "quant_method", None) is not None
+            and layer.quant_method.kind is QuantKind.NONE
+        ]
     if not layers:
         return None
     keys = {(layer.quant_method.kind, layer.quant_method.kernel.name) for layer in layers}
@@ -1485,7 +1499,13 @@ def offload_expert_method(config: EngineConfig):
     object.__setattr__(config.model_config, "decode_target", "gpu")
     with torch.device("meta"), torch_dtype(config.dtype):
         model = create_model(config.model_config)
-    return shared_offload_method(model)
+    return shared_offload_method(
+        model,
+        include_unquantized=(
+            config.model_config.expert_quant == "none"
+            and config.model_config.moe_weight_format is None
+        ),
+    )
 
 
 def _adjust_config(config: EngineConfig):
