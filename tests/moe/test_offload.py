@@ -88,7 +88,7 @@ def test_shared_offload_method_can_select_unquantized_hf_moe():
 def test_qwen4_exp_native_experts_do_not_use_unquantized_method():
     from types import SimpleNamespace
 
-    from freetoken.engine.engine import _include_unquantized_offload_method
+    from freetoken.engine.engine import _fused_resident_ok, _include_unquantized_offload_method
 
     qwen4_config = SimpleNamespace(
         model_type="qwen4_exp", expert_quant="none", moe_weight_format=None,
@@ -99,6 +99,8 @@ def test_qwen4_exp_native_experts_do_not_use_unquantized_method():
 
     assert not _include_unquantized_offload_method(qwen4_config)
     assert _include_unquantized_offload_method(bf16_config)
+    assert not _fused_resident_ok(qwen4_config)
+    assert _fused_resident_ok(bf16_config)
 
 
 def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypatch):

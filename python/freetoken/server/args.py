@@ -60,6 +60,7 @@ class ServerArgs(SchedulerConfig):
     # prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Responses
     # input_tokens_details.cached_tokens). Mirrors sglang's --enable-cache-report.
     enable_cache_report: bool = False
+    anthropic_inline_system: str = "auto"
     # Comma-separated hostname allowlist for client-supplied image URLs; empty admits any domain.
     allowed_media_domains: str = ""
     # Directory file:// image refs may be read from; empty rejects local files.
@@ -271,6 +272,17 @@ def parse_args(
         default="auto",
         choices=["auto", "float16", "bfloat16", "float32"],
         help="Data type for model weights and activations. 'auto' will use FP16 for FP32/FP16 models and BF16 for BF16 models.",
+    )
+
+    parser.add_argument(
+        "--hf-overrides",
+        type=_json_object,
+        default=None,
+        metavar="JSON",
+        help="JSON object applied to the checkpoint config the model is built from, as vLLM's "
+        "--hf-overrides: a nested config section is updated key by key, any other value is "
+        "replaced whole. A YaRN rope_parameters override extends the servable context to "
+        "original_max_position_embeddings * factor.",
     )
 
     parser.add_argument(
@@ -526,6 +538,14 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--anthropic-inline-system",
+        choices=("auto", "preserve", "fold"),
+        default=ServerArgs.anthropic_inline_system,
+        help="Preserve inline system instructions when supported by the renderer, "
+        "or fold them into nearby user/tool content without hoisting the prompt prefix.",
+    )
+
+    parser.add_argument(
         "--sampling-defaults",
         type=str,
         default=ServerArgs.sampling_defaults,
@@ -590,8 +610,8 @@ def parse_args(
         choices=["auto", *MOE_STRATEGIES],
         help=(
             "How the routed experts are served. 'auto' resolves a MoE model to the offload family "
-            "(offload, or hybrid when a `ft bench bw` profile recommends it); resident "
-            "'fused' experts must be requested explicitly."
+            "(offload, or hybrid when a `ft bench bw` profile recommends it), and to resident "
+            "'fused' experts on unified-memory GPUs (GB10 / DGX Spark)."
         ),
     )
 
@@ -924,6 +944,7 @@ def parse_args(
         image_max_tokens=image_max_tokens,
         processor_kwargs=kwargs.pop("mm_processor_kwargs") or {},
     )
+    kwargs["hf_overrides"] = kwargs["hf_overrides"] or {}
     result = ServerArgs(**kwargs)
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell
