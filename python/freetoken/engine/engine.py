@@ -622,10 +622,7 @@ class Engine:
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         method = shared_offload_method(
             self.model,
-            include_unquantized=(
-                config.model_config.expert_quant == "none"
-                and config.model_config.moe_weight_format is None
-            ),
+            include_unquantized=_include_unquantized_offload_method(config.model_config),
         )
         num_moe_layers = config.model_config.num_moe_layers
         cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
@@ -1487,6 +1484,14 @@ def shared_offload_method(model, *, include_unquantized: bool = False):
     return layers[0].quant_method
 
 
+def _include_unquantized_offload_method(model_config) -> bool:
+    return (
+        model_config.model_type != "qwen4_exp"
+        and model_config.expert_quant == "none"
+        and model_config.moe_weight_format is None
+    )
+
+
 def offload_expert_method(config: EngineConfig):
     """The offload expert method of ``config``'s model, from a meta-device build.
 
@@ -1501,10 +1506,7 @@ def offload_expert_method(config: EngineConfig):
         model = create_model(config.model_config)
     return shared_offload_method(
         model,
-        include_unquantized=(
-            config.model_config.expert_quant == "none"
-            and config.model_config.moe_weight_format is None
-        ),
+        include_unquantized=_include_unquantized_offload_method(config.model_config),
     )
 
 
