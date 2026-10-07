@@ -31,8 +31,34 @@ The disk-tier prototype currently targets Qwen4Exp/Qwen3.8 native NVFP4 checkpoi
 - Native Q8_0 Gemma4 GGUF embeddings, projections, and routed experts.
 - Qwen3.8 FP8 GDN loading with preserved weight scales.
 - BF16 Qwen3.8 vision-tower loading alongside the quantized text tower.
+- Windows Qwen4Exp disk PLE fallback to the compatible legacy native store.
 - Windows-safe expert-bank residency and stale compiled-module shadow handling.
 - GGUF tokenizer, metadata, and model-repair utilities for local checkpoints.
+
+## Recent upstream additions
+
+- Resident expert-bank execution for NVFP4 and MXFP4 MoE models where the selected model/backend supports it.
+- YaRN-aware rotary table sizing and the `--hf-overrides` option for checkpoint configuration overrides.
+- Experimental Linux ROCm support for AMD RDNA3/RDNA4 GPUs; see [AMD installation](docs/install_amd.md).
+- A shared disk-backed PLE row store with staging-race protection, plus faster QSA sparse top-k selection.
+- KV-cache memory fixes, Anthropic system-message prefix reuse, and more accurate KV page reporting.
+
+## Local Windows deployment archive
+
+[`freetoken-0.1.3+g52322e984-site-lib.zip`](freetoken-0.1.3+g52322e984-site-lib.zip) is a site-library snapshot for Windows CPython 3.12. It includes the `freetoken` package, active native extensions, and a version manifest; it excludes bytecode caches and disabled shadow modules, and anonymizes account-name strings embedded in binaries.
+
+Stop the FreeToken daemon and server before extracting it into the app environment:
+
+```powershell
+$sitePackages = Join-Path $env:LOCALAPPDATA 'FreeToken\venv\Lib\site-packages'
+$ftwExtension = Join-Path $sitePackages 'freetoken\checkpoint\ftw.cp312-win_amd64.pyd'
+if (Test-Path $ftwExtension) {
+  Rename-Item -LiteralPath $ftwExtension -NewName 'ftw.cp312-win_amd64.pyd.local-disabled'
+}
+Expand-Archive -LiteralPath .\freetoken-0.1.3+g52322e984-site-lib.zip -DestinationPath $sitePackages -Force
+```
+
+Restart the daemon or server after extraction so it imports the updated package.
 
 
 Unlock datacenter-class intelligence on the hardware you already own — Run 290B+ frontier MoE models locally on your gaming PC at blistering interactive speeds.
